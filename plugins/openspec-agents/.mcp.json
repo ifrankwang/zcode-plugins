@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "openspec-agents": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/.mcp-server/cli.mjs",
+        "--transport",
+        "stdio",
+        "--worktree",
+        "${CLAUDE_PROJECT_DIR}",
+        "--unattended"
+      ]
+    }
+  }
+}

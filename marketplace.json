@@ -1,0 +1,15 @@
+{
+  "name": "ifrankwang",
+  "description": "ifrankwang 的个人插件市场：OpenSpec change 编排插件",
+  "owner": {
+    "name": "ifrankwang"
+  },
+  "plugins": [
+    {
+      "name": "openspec-agents",
+      "source": "./plugins/openspec-agents",
+      "description": "OpenSpec change 编排：opx_* 编排工具（MCP）+ 编排子代理 + orchestrator skill，非 OpenCode agent 默认无人值守",
+      "version": "0.119.0"
+    }
+  ]
+}
