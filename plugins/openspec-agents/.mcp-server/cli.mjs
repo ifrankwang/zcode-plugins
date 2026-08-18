@@ -36985,12 +36985,13 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.119.1";
+var PKG_VERSION = "0.120.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
-    mcp.registerTool(name, {
-      title: name,
+    const toolName = opts.stripOpxPrefix ? name.replace(/^opx_/, "") : name;
+    mcp.registerTool(toolName, {
+      title: toolName,
       description: spec.description,
       inputSchema: jsonSchemaToZod(withAgentArg(spec.schema))
     }, async (args, _extra) => {
@@ -39559,13 +39560,14 @@ function parseArgs(argv) {
     worktree: args.get("worktree") ?? process.cwd(),
     port: args.get("port") ? Number(args.get("port")) : DEFAULT_PORT,
     transport,
-    unattended: flags.has("unattended")
+    unattended: flags.has("unattended"),
+    stripOpxPrefix: flags.has("strip-opx-prefix")
   };
 }
 async function main(argv) {
   const opts = parseArgs(argv);
   if (opts.transport === "stdio") {
-    const mcp = buildMcpServer(opts.worktree, { unattended: opts.unattended });
+    const mcp = buildMcpServer(opts.worktree, { unattended: opts.unattended, stripOpxPrefix: opts.stripOpxPrefix });
     await mcp.connect(new StdioServerTransport);
     return;
   }

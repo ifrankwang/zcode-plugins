@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "openspec-agents": {
+    "opx": {
       "type": "stdio",
       "command": "node",
       "args": [
@@ -9,7 +9,8 @@
         "stdio",
         "--worktree",
         "${CLAUDE_PROJECT_DIR}",
-        "--unattended"
+        "--unattended",
+        "--strip-opx-prefix"
       ]
     }
   }
