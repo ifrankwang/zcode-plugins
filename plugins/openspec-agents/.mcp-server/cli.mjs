@@ -34170,28 +34170,6 @@ var SIMPLE_WORKFLOW_PATH = resolveWorkflowFilePath(import.meta.url, "task-simple
 function resolveWorkflowPath(state) {
   return state.mode === "simple" ? SIMPLE_WORKFLOW_PATH : TASK_WORKFLOW_PATH;
 }
-var WORKFLOW_MODE_CONFIG_FILE = "openspec/workflow.yaml";
-function readWorkflowModeConfig(worktree) {
-  const configPath = pathResolve(worktree, WORKFLOW_MODE_CONFIG_FILE);
-  if (!existsSync2(configPath))
-    return "full";
-  let raw;
-  try {
-    raw = yaml.load(readFileSync2(configPath, "utf-8"));
-  } catch (err) {
-    fail(`${WORKFLOW_MODE_CONFIG_FILE} 解析失败：${err.message}`);
-  }
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-    fail(`${WORKFLOW_MODE_CONFIG_FILE} 配置非法：顶层必须是 YAML 映射对象`);
-  }
-  const mode = raw.mode;
-  if (mode === undefined)
-    return "full";
-  if (mode !== "full" && mode !== "simple") {
-    fail(`${WORKFLOW_MODE_CONFIG_FILE} 配置非法：mode 值域为 full/simple，收到 ${JSON.stringify(mode)}`);
-  }
-  return mode;
-}
 var workflowFileCache = new Map;
 function loadWorkflowFile(filePath) {
   let wf = workflowFileCache.get(filePath);
@@ -35752,6 +35730,9 @@ async function initExecute(params, ctx) {
     args.recovery = parsed;
   }
   assertValidRecovery(args.recovery);
+  if (args.mode !== undefined && args.mode !== "full" && args.mode !== "simple") {
+    throw new Error(`mode 参数不合法，合法值：full、simple。传入值："${String(args.mode)}"。`);
+  }
   const parsedGroups = await parseAllTaskGroupsFromMd(ctx.worktree, args.change_id);
   if (parsedGroups.length === 0) {
     throw new Error(`无法从 tasks.md 解析出任务组，请检查文件 openspec/changes/${args.change_id}/tasks.md。`);
@@ -35784,7 +35765,7 @@ async function initExecute(params, ctx) {
       workItems: [],
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      mode: readWorkflowModeConfig(ctx.worktree)
+      mode: args.mode ?? "simple"
     };
   } else {
     state.baseBranch = state.baseBranch || baseBranch;
@@ -36833,7 +36814,12 @@ var orchInitSchema = {
       type: "string",
       description: "基准分支名（如 main、develop），用于计算 merge-base 和 worktree fork 源。未传则自动从当前 git 分支推导。"
     },
-    recovery: recoverySchema
+    recovery: recoverySchema,
+    mode: {
+      type: "string",
+      enum: ["full", "simple"],
+      description: "流程模式选择：full=完整流程（analyze→implement→三重审查+收尾验证）；simple=精简流程（implement→quality_review→done，缺省）。仅新建编排状态（首次 opx_orch_init）时生效；已开始的变更沿用固化模式，不支持中途切换。"
+    }
   },
   required: ["change_id", "task_group_id"],
   additionalProperties: false
@@ -37024,7 +37010,7 @@ function jsonSchemaToZod(schema2) {
 var AGENT_ARG = "_agent";
 var TOOL_SPECS = {
   opx_orch_init: {
-    description: "初始化编排会话。传入变更 ID 和任务组 ID，工具自动解析 tasks.md 提取全部任务组并解析目标组子任务。可通过 recovery 参数恢复到指定阶段。无 recovery 重复初始化当前任务组时保留其阶段和进度；切换到其它任务组时初始化该组。",
+    description: "初始化编排会话。传入变更 ID 和任务组 ID，工具自动解析 tasks.md 提取全部任务组并解析目标组子任务。可通过 recovery 参数恢复到指定阶段。无 recovery 重复初始化当前任务组时保留其阶段和进度；切换到其它任务组时初始化该组。可选 mode 参数（full/simple，缺省 simple）选择流程模式，仅新建状态生效。",
     schema: orchInitSchema,
     execute: (args, ctx) => initExecute(args, ctx)
   },
@@ -37084,7 +37070,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.121.1";
+var PKG_VERSION = "0.122.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
