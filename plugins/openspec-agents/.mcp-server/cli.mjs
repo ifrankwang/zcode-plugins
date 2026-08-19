@@ -35133,7 +35133,7 @@ function renderAgentWorking(item, rec, step, common2, ctxAgent, state, tg, toolC
   lines.push(...eff.lines);
   n = eff.nextNum;
   if (tg.worktreePath && tg.baseRef) {
-    lines.push(`${n++}. 用上方「变更范围」命令获取本 change 全部已提交变更文件清单，作为本次工作范围`);
+    lines.push(`${n++}. 用上方「变更范围」命令获取本 change 全部已提交变更文件清单，作为本次实施/修改范围；审查/报告范围以当前 step 指令为准`);
   }
   lines.push(`${n++}. 执行当前 step（\`${rec.stepId}\`）职责范围内的全部工作——遵循所有已加载 skill 的全部规范与约束`);
   lines.push(`${n++}. 逐项检视所有已加载 skill 的 MUST 规范，确认全部满足（不满足则补做，不得跳过）`);
@@ -36985,7 +36985,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.120.0";
+var PKG_VERSION = "0.120.1";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
