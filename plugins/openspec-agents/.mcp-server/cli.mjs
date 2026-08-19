@@ -29426,6 +29426,8 @@ function agentToReviewLayer(agent) {
     return "tool";
   if (agent === "openspec-reviewer-task")
     return "task";
+  if (agent === "openspec-reviewer")
+    return "quality";
   if (agentToReviewDimension(agent))
     return "quality";
   return;
@@ -29735,7 +29737,8 @@ function stepAgentIds(step) {
 var REVIEW_STEP_TO_LAYER = {
   verify_tool: "tool",
   verify_task: "task",
-  verify_quality: "quality"
+  verify_quality: "quality",
+  quality_review: "quality"
 };
 function childSourcePhase(child) {
   return reviewLayerFromMetadata(child);
@@ -30590,7 +30593,8 @@ async function readStateByChangeId(worktree, changeId) {
     workItems: needsUpgrade ? upgradeWorkItemsFromTaskGroups(legacy.taskGroups ?? []) : legacy.workItems,
     createdAt: legacy.createdAt,
     updatedAt: legacy.updatedAt,
-    unattended: legacy.unattended
+    unattended: legacy.unattended,
+    mode: legacy.mode
   };
   if (needsUpgrade) {
     migrateLegacyStateDir(worktree);
@@ -34142,12 +34146,12 @@ var yaml = /* @__PURE__ */ getDefaultExportFromCjs(jsYamlExports);
 var SPECIAL_TRANSITIONS = ["done", "halt"];
 var PHASE_NAMES = new Set(WORK_ITEM_PHASES);
 var QUALITY_REVIEW_STEP_ID = "verify_quality";
-function resolveTaskWorkflowPath(moduleUrl) {
+function resolveWorkflowFilePath(moduleUrl, fileName) {
   const startDir = dirname(fileURLToPath(moduleUrl));
   let dir = startDir;
   let probed = 0;
   for (;; ) {
-    const candidate = pathResolve(dir, "assets", "workflows", "task.yaml");
+    const candidate = pathResolve(dir, "assets", "workflows", fileName);
     if (existsSync2(candidate))
       return candidate;
     probed++;
@@ -34156,9 +34160,38 @@ function resolveTaskWorkflowPath(moduleUrl) {
       break;
     dir = parent;
   }
-  throw new Error(`workflow 文件缺失：从 ${startDir} 上溯 ${probed} 级未找到 assets/workflows/task.yaml`);
+  throw new Error(`workflow 文件缺失：从 ${startDir} 上溯 ${probed} 级未找到 assets/workflows/${fileName}`);
+}
+function resolveTaskWorkflowPath(moduleUrl) {
+  return resolveWorkflowFilePath(moduleUrl, "task.yaml");
 }
 var TASK_WORKFLOW_PATH = resolveTaskWorkflowPath(import.meta.url);
+var SIMPLE_WORKFLOW_PATH = resolveWorkflowFilePath(import.meta.url, "task-simple.yaml");
+function resolveWorkflowPath(state) {
+  return state.mode === "simple" ? SIMPLE_WORKFLOW_PATH : TASK_WORKFLOW_PATH;
+}
+var WORKFLOW_MODE_CONFIG_FILE = "openspec/workflow.yaml";
+function readWorkflowModeConfig(worktree) {
+  const configPath = pathResolve(worktree, WORKFLOW_MODE_CONFIG_FILE);
+  if (!existsSync2(configPath))
+    return "full";
+  let raw;
+  try {
+    raw = yaml.load(readFileSync2(configPath, "utf-8"));
+  } catch (err) {
+    fail(`${WORKFLOW_MODE_CONFIG_FILE} 解析失败：${err.message}`);
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    fail(`${WORKFLOW_MODE_CONFIG_FILE} 配置非法：顶层必须是 YAML 映射对象`);
+  }
+  const mode = raw.mode;
+  if (mode === undefined)
+    return "full";
+  if (mode !== "full" && mode !== "simple") {
+    fail(`${WORKFLOW_MODE_CONFIG_FILE} 配置非法：mode 值域为 full/simple，收到 ${JSON.stringify(mode)}`);
+  }
+  return mode;
+}
 var workflowFileCache = new Map;
 function loadWorkflowFile(filePath) {
   let wf = workflowFileCache.get(filePath);
@@ -35155,7 +35188,8 @@ var STEP_ID_TO_CONTEXT_KIND = {
   verify_tool: "review_tool",
   verify_task: "review_task",
   verify_quality: "review_quality",
-  verify_cleanup: "review_cleanup"
+  verify_cleanup: "review_cleanup",
+  quality_review: "review_merged"
 };
 function stepContextKind(stepId) {
   return STEP_ID_TO_CONTEXT_KIND[stepId];
@@ -35180,6 +35214,9 @@ function renderStepContext(item, step, ctxAgent, state, exemptionCtx) {
       break;
     case "review_quality":
       lines.push(...renderQualityChildren(item, ctxAgent, exemptionCtx));
+      break;
+    case "review_merged":
+      lines.push(...renderMergedChildren(item, ctxAgent, exemptionCtx));
       break;
     case "review_cleanup":
       lines.push(...renderCleanupChildren(item, ctxAgent, exemptionCtx));
@@ -35274,14 +35311,18 @@ function isToolAdjudicable(child) {
 function isTaskAdjudicable(child) {
   return child.metadata[EXEMPT_REQUEST_KEY] !== undefined && agentToReviewLayer(readIssueSource(child)) === "task";
 }
-function isQualityAdjudicable(child, dimension) {
-  if (child.metadata[EXEMPT_REQUEST_KEY] === undefined || !dimension)
+function isQualityAdjudicable(child, dimension, ctxAgent) {
+  if (child.metadata[EXEMPT_REQUEST_KEY] === undefined)
     return false;
-  return agentToReviewDimension(readIssueSource(child) ?? "") === dimension;
+  if (dimension)
+    return agentToReviewDimension(readIssueSource(child) ?? "") === dimension;
+  if (ctxAgent)
+    return readIssueSource(child) === ctxAgent;
+  return false;
 }
 function isAdjudicableExempt(child, layer, ctxAgent) {
   if (layer === "quality")
-    return isQualityAdjudicable(child, agentToDimension(ctxAgent));
+    return isQualityAdjudicable(child, agentToDimension(ctxAgent), ctxAgent);
   if (layer === "tool")
     return isToolAdjudicable(child);
   if (layer === "task")
@@ -35300,8 +35341,9 @@ function isAgentOwnedIssue(child, ctxAgent) {
     return false;
   if (layer === "quality") {
     const dim = agentToReviewDimension(ctxAgent);
-    if (!dim)
-      return false;
+    if (!dim) {
+      return readIssueSource(child) === ctxAgent;
+    }
     return agentToReviewDimension(readIssueSource(child) ?? "") === dim;
   }
   return true;
@@ -35407,7 +35449,23 @@ function renderQualityChildren(item, ctxAgent, exemptionCtx) {
   const own = issues.filter((c) => isAgentOwnedIssue(c, ctxAgent));
   const lines = [];
   lines.push(...renderChildrenSection("Issue (待复核)", own, exemptionCtx));
-  const pending = issues.filter((c) => isQualityAdjudicable(c, dimension));
+  const pending = issues.filter((c) => isQualityAdjudicable(c, dimension, ctxAgent));
+  lines.push(...renderChildrenSection("Issue (待裁定是否可豁免)", pending, exemptionCtx));
+  return lines;
+}
+function renderMergedChildren(item, ctxAgent, exemptionCtx) {
+  const lines = [];
+  const pendingTasks = readTasks(item).filter((t) => t.status === "submitted");
+  if (pendingTasks.length > 0) {
+    lines.push("## Task (待验证)", "");
+    for (const t of pendingTasks)
+      lines.push(renderTaskItem(t));
+    lines.push("");
+  }
+  const issues = issueChildrenOf(item);
+  const own = issues.filter((c) => isAgentOwnedIssue(c, ctxAgent));
+  lines.push(...renderChildrenSection("Issue (待复核)", own, exemptionCtx));
+  const pending = issues.filter((c) => isQualityAdjudicable(c, agentToDimension(ctxAgent), ctxAgent));
   lines.push(...renderChildrenSection("Issue (待裁定是否可豁免)", pending, exemptionCtx));
   return lines;
 }
@@ -35575,10 +35633,35 @@ function firstUnpassedReviewStep(item, workflow) {
   }
   return null;
 }
-function applyRecoveryState(item, recovery, parsedTasks) {
+function applyRecoveryState(item, recovery, parsedTasks, mode) {
   delete item.metadata["_advance_block_reason"];
   resetInternalRetryCount(item);
   delete item.metadata["_checkpoint"];
+  if (mode === "simple") {
+    const phase2 = recovery?.phase;
+    if (!phase2 || phase2 === "task_analysis" || phase2 === "dev_impl") {
+      item.phase = "in_progress";
+      item.currentStep = "implement";
+      item.tags = {};
+      if (!phase2 || phase2 === "task_analysis") {
+        syncTaskChildren(item, parsedTasks, { forceOpen: true });
+      } else {
+        syncTaskChildren(item, parsedTasks, { defaultStatus: "todo" });
+      }
+      return;
+    }
+    item.phase = "review";
+    item.tags["implement:openspec-developer"] = "passed";
+    for (const key of Object.keys(item.tags)) {
+      if (key.startsWith("quality_review:")) {
+        if (item.tags[key] !== "passed")
+          delete item.tags[key];
+      }
+    }
+    item.currentStep = "quality_review";
+    syncTaskChildren(item, parsedTasks, { defaultStatus: "done" });
+    return;
+  }
   const phase = recovery?.phase;
   if (!phase || phase === "task_analysis") {
     item.phase = "todo";
@@ -35612,7 +35695,7 @@ function applyRecoveryState(item, recovery, parsedTasks) {
   if (recovery?.review_layer === "quality") {
     item.tags["verify_task:openspec-reviewer-task"] = "passed";
   }
-  const workflow = loadWorkflowFile(TASK_WORKFLOW_PATH);
+  const workflow = loadWorkflowFile(resolveWorkflowPath({ mode }));
   item.currentStep = firstUnpassedReviewStep(item, workflow);
   if (item.currentStep === null) {
     const unfinishedTasks = item.children.filter((child) => child.type === "task" && !isTerminalPhase(child.phase));
@@ -35700,7 +35783,8 @@ async function initExecute(params, ctx) {
       baseBranch,
       workItems: [],
       createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      mode: readWorkflowModeConfig(ctx.worktree)
     };
   } else {
     state.baseBranch = state.baseBranch || baseBranch;
@@ -35731,7 +35815,12 @@ async function initExecute(params, ctx) {
           description: group.name,
           labels: ["openspec-change"]
         });
-        item2.currentStep = "analyze";
+        if (state.mode === "simple") {
+          item2.phase = "in_progress";
+          item2.currentStep = "implement";
+        } else {
+          item2.currentStep = "analyze";
+        }
         syncTaskChildren(item2, groupTasks, { defaultStatus: "todo" });
         refreshMeta(item2);
         state.workItems.push(item2);
@@ -35779,7 +35868,7 @@ async function initExecute(params, ctx) {
       item.metadata["branch_name"] = null;
       item.metadata["base_ref"] = null;
     }
-    applyRecoveryState(item, args.recovery, groupTasks);
+    applyRecoveryState(item, args.recovery, groupTasks, state.mode);
     refreshMeta(item);
     if (!existing)
       state.workItems.push(item);
@@ -35909,7 +35998,7 @@ async function statusExecute(params, ctx) {
   if (!item) {
     return "编排会话未就绪：找不到活跃任务组的工作项，请重新调用 opx_orch_init。";
   }
-  const workflow = loadWorkflowFile(TASK_WORKFLOW_PATH);
+  const workflow = loadWorkflowFile(resolveWorkflowPath(state));
   const rec = recommendForItem(item, workflow);
   const tg = findTaskGroup(state, state.taskGroupId);
   const mainPollution = ctx.orchestrator ? await detectMainRepoPollution(ctx.worktree) : null;
@@ -35994,7 +36083,7 @@ async function setUnattendedExecute(params, ctx) {
 }
 
 // src/core/tools/submit.ts
-var loadTaskWorkflow = () => loadWorkflowFile(TASK_WORKFLOW_PATH);
+var loadTaskWorkflow = (state) => loadWorkflowFile(resolveWorkflowPath(state));
 function normalizeIssueId(id) {
   return String(id).trim().replace(/^#/, "");
 }
@@ -36211,6 +36300,9 @@ function assertFailedHasReason(item, params, newChildren, stepId, agent) {
   } else if (stepId === "verify_cleanup") {
     layerName = "收尾层";
     hasReason = hasNewBlocking || existingBlocking.length > 0;
+  } else if (stepId === "quality_review") {
+    layerName = "AI 审查层";
+    hasReason = hasNewBlocking || existingBlocking.some((c) => resolveChildIssueFields(c).sourcePhase === "quality");
   } else {
     const dimension = agentToReviewDimension(agent);
     layerName = dimension ? `AI 审查层(${dimension})` : "AI 审查层";
@@ -36292,7 +36384,7 @@ async function agentSubmitExecute(params, ctx) {
     const state = await readStateByWorktree(ctx.worktree, params.change_id);
     if (!state)
       throw new Error("编排会话未初始化。请先调用 opx_orch_init。");
-    const workflow = loadTaskWorkflow();
+    const workflow = loadTaskWorkflow(state);
     const item = resolveTaskWorkItem(state);
     if (params.checkpoint_decision) {
       return applyCheckpointDecision(params, item, workflow, ctx, state);
@@ -36419,6 +36511,13 @@ async function agentSubmitExecute(params, ctx) {
     } else if (stepPhase === "todo") {
       handleAnalyzeParams(item, params);
     } else if (stepPhase === "in_progress") {
+      if (state.mode === "simple" && params.step_id === "implement") {
+        const clean = await isWorktreeClean(wtPath);
+        if (!clean) {
+          throw new Error(`simple 模式 implement 提交被拒绝：工作区存在未提交内容。
+请先 git commit 提交全部变更后再提交 implement。`);
+        }
+      }
       handleImplementParams(item, params);
     }
     const { accepted } = dedupeNewChildren(item, newChildren);
@@ -36985,7 +37084,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.120.1";
+var PKG_VERSION = "0.121.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
