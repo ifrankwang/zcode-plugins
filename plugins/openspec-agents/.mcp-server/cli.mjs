@@ -34345,20 +34345,42 @@ function loadWorkflow(yamlText) {
 import { readFileSync as readFileSync4 } from "node:fs";
 
 // src/skills/scan.ts
-import { existsSync as existsSync3 } from "node:fs";
+import { existsSync as existsSync3, readdirSync as readdirSync2 } from "node:fs";
 import { resolve, dirname as dirname2, join as join2 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 import { homedir } from "node:os";
 var projectRoot = resolve(dirname2(fileURLToPath2(import.meta.url)), "..", "..");
+function resolveSkillScanRoot(moduleUrl) {
+  const startDir = dirname2(fileURLToPath2(moduleUrl));
+  let dir = startDir;
+  for (;; ) {
+    for (const candidate of [resolve(dir, "assets", "skills"), resolve(dir, "skills")]) {
+      if (isSkillRoot(candidate))
+        return candidate;
+    }
+    const parent = dirname2(dir);
+    if (parent === dir)
+      break;
+    dir = parent;
+  }
+  return null;
+}
+function isSkillRoot(candidate) {
+  if (!existsSync3(candidate))
+    return false;
+  try {
+    return readdirSync2(candidate, { withFileTypes: true }).some((entry) => entry.isDirectory() && existsSync3(join2(candidate, entry.name, "SKILL.md")));
+  } catch {
+    return false;
+  }
+}
+var scanRoot = resolveSkillScanRoot(import.meta.url);
 var SKILL_SCAN_ROOTS = [
-  resolve(projectRoot, "assets", "skills"),
+  ...scanRoot ? [scanRoot] : [],
   resolve(projectRoot, ".agents", "skills"),
   resolve(projectRoot, ".opencode", "skills"),
   join2(homedir(), ".agents", "skills"),
   join2(homedir(), ".config", "opencode", "skills")
-];
-var DISTRIBUTED_SKILL_ROOTS = [
-  resolve(projectRoot, "assets", "skills")
 ];
 function findSkillPath(name) {
   for (const root of SKILL_SCAN_ROOTS) {
@@ -34370,7 +34392,7 @@ function findSkillPath(name) {
 }
 
 // src/skills/resolve.ts
-import { readdirSync as readdirSync2, readFileSync as readFileSync3, existsSync as existsSync4 } from "node:fs";
+import { readdirSync as readdirSync3, readFileSync as readFileSync3, existsSync as existsSync4 } from "node:fs";
 import { resolve as resolve2 } from "node:path";
 var cacheKey = null;
 var cacheIndex = null;
@@ -34385,7 +34407,7 @@ function scanSkillTags(roots = SKILL_SCAN_ROOTS) {
   for (const root of roots) {
     if (!existsSync4(root))
       continue;
-    for (const entry of readdirSync2(root, { withFileTypes: true })) {
+    for (const entry of readdirSync3(root, { withFileTypes: true })) {
       if (!entry.isDirectory())
         continue;
       if (seen.has(entry.name))
@@ -37070,7 +37092,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.122.0";
+var PKG_VERSION = "0.122.1";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
@@ -39211,7 +39233,7 @@ class StreamableHTTPServerTransport {
 import { createServer } from "node:http";
 
 // src/core/dashboard.ts
-import { readdirSync as readdirSync3, existsSync as existsSync5 } from "node:fs";
+import { readdirSync as readdirSync4, existsSync as existsSync5 } from "node:fs";
 import { readFile as readFile5 } from "node:fs/promises";
 import path7 from "path";
 function toWorkItemCard(item) {
@@ -39268,7 +39290,7 @@ async function readDashboardState(worktree, changeId) {
   const stateDir = getStateDir(worktree);
   if (!existsSync5(stateDir))
     return null;
-  const files = readdirSync3(stateDir).filter((f) => f.endsWith(".json"));
+  const files = readdirSync4(stateDir).filter((f) => f.endsWith(".json"));
   const results = [];
   for (const f of files) {
     try {
@@ -39356,7 +39378,7 @@ async function startDashboard(worktree) {
   console.error(`[dashboard] 无法启动编排进度看板：端口 ${BASE_PORT}-${BASE_PORT + MAX_ATTEMPTS - 1} 均被占用`);
 }
 // src/core/workflow/collector.ts
-import { readdirSync as readdirSync4, readFileSync as readFileSync6 } from "node:fs";
+import { readdirSync as readdirSync5, readFileSync as readFileSync6 } from "node:fs";
 import { join as join4 } from "node:path";
 var DEFAULT_POLL_INTERVAL_MS = 30000;
 var SOURCE = "openspec";
@@ -39394,7 +39416,7 @@ class OpenSpecCollector {
     const changesDir = join4(this.openspecDir, "changes");
     let entries;
     try {
-      entries = readdirSync4(changesDir, { withFileTypes: true });
+      entries = readdirSync5(changesDir, { withFileTypes: true });
     } catch {
       return [];
     }
