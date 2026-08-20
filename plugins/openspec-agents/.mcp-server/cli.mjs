@@ -36051,6 +36051,14 @@ async function completeTaskGroupExecute(params, ctx) {
   if (unresolvedBlockers.length > 0) {
     throw new Error(`存在 ${unresolvedBlockers.length} 个未解决 blocker，无法完成任务组。`);
   }
+  let checkboxWarning = "";
+  if (worktreePath) {
+    try {
+      await markTaskGroupCheckboxesComplete(worktreePath, params.change_id, state.taskGroupId);
+    } catch (e) {
+      checkboxWarning = `- **tasks.md 复选框勾选失败**: ${e instanceof Error ? e.message : String(e)}（不影响收尾）`;
+    }
+  }
   const mergeTarget = state.baseBranch;
   if (branchName) {
     const mergeResult = await mergeBranchToTarget(ctx.worktree, branchName, mergeTarget);
@@ -36072,7 +36080,9 @@ async function completeTaskGroupExecute(params, ctx) {
   }
   item.metadata["completed_at"] = new Date().toISOString();
   await writeState(ctx.worktree, state);
-  return `任务组已完成并合并到 "${mergeTarget}"。`;
+  const doneMessage = `任务组已完成并合并到 "${mergeTarget}"。`;
+  return checkboxWarning ? `${doneMessage}
+${checkboxWarning}` : doneMessage;
 }
 async function setUnattendedExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_set_unattended");
@@ -36548,10 +36558,6 @@ async function agentSubmitExecute(params, ctx) {
         changeId: state.changeId,
         baseRef
       });
-    }
-    if (params.step_id === "verify_task" && params.verdict === "passed" && taskChildrenOf(item).every((c) => isTerminalPhase(c.phase))) {
-      const worktreePath = typeof item.metadata["worktree_path"] === "string" ? item.metadata["worktree_path"] : ctx.worktree;
-      await markTaskGroupCheckboxesComplete(worktreePath, params.change_id, state.taskGroupId);
     }
     if (params.step_id === "verify_tool" && agentToReviewLayer(ctx.agent) === "tool") {
       const head = await getCurrentHead(wtPath);
@@ -37092,7 +37098,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.122.1";
+var PKG_VERSION = "0.123.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {

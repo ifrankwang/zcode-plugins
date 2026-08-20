@@ -1,6 +1,6 @@
 {
   "name": "openspec-agents",
-  "version": "0.122.1",
+  "version": "0.123.0",
   "description": "OpenSpec change 编排：opx_* 编排工具（MCP）+ 编排子代理 + orchestrator skill，非 OpenCode agent 默认无人值守",
   "license": "MIT",
   "author": {
