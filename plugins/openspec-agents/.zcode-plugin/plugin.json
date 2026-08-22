@@ -1,9 +1,9 @@
 {
   "name": "openspec-agents",
-  "version": "0.126.0",
-  "description": "OpenSpec change 编排：opx_* 编排工具（MCP）+ 编排子代理 + orchestrator skill，非 OpenCode agent 默认无人值守",
+  "version": "0.127.0",
+  "description": "OpenSpec change orchestration for AI coding agents: turn OpenSpec change specs into reviewed, high-quality code.",
   "license": "MIT",
   "author": {
-    "name": "openspec-agents maintainers"
+    "name": "ifrankwang"
   }
 }

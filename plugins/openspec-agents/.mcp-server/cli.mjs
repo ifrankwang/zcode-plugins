@@ -35738,6 +35738,15 @@ function assertValidRecovery(recovery) {
     }
   }
 }
+function otherTaskGroupsSettled(state, targetGroupId) {
+  return state.workItems.filter((w) => w.id.startsWith("task:") && w.id !== `task:${targetGroupId}`).every((item) => {
+    if (item.phase === "done" || item.metadata["completed_at"] !== undefined)
+      return true;
+    const noTags = Object.keys(item.tags).length === 0;
+    const childrenSettled = item.children.filter((c) => c.type === "task").every((c) => c.phase === "todo" || isTerminalPhase(c.phase));
+    return noTags && childrenSettled;
+  });
+}
 async function initExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_init");
   const args = { ...params };
@@ -35780,6 +35789,19 @@ async function initExecute(params, ctx) {
   const baseBranch = args.base_branch || await getCurrentBranch(ctx.worktree);
   let state = await readStateByChangeId(ctx.worktree, args.change_id);
   const wasCurrentGroup = state?.taskGroupId === args.task_group_id;
+  let modeSwitchNote = null;
+  if (state && args.mode !== undefined && args.mode !== (state.mode ?? "full")) {
+    const othersSettled = otherTaskGroupsSettled(state, args.task_group_id);
+    const withinWindow = (args.task_group_id !== state.taskGroupId || args.recovery?.phase === "task_analysis") && othersSettled;
+    if (!withinWindow) {
+      throw new Error(`mode 参数与已固化的流程模式不一致：已固化 mode="${state.mode ?? "full"}"${state.mode === undefined ? "（旧变更未固化，读取时兜底 full）" : ""}，传入值："${args.mode}"。
+` + `当前场景不允许切换流程模式：切换任务组须其他任务组均已完成或从未激活；重制当前组仅支持 recovery.phase="task_analysis"（其他任务组同样须已完成或从未激活）。
+` + `请去掉 mode 参数继续沿用固化模式，或满足上述窗口条件后再切换。`);
+    }
+    const prevMode = state.mode;
+    state.mode = args.mode;
+    modeSwitchNote = `流程模式已从 ${prevMode ?? "full"} 切换为 ${args.mode}。`;
+  }
   if (!state) {
     state = {
       changeId: args.change_id,
@@ -35880,7 +35902,12 @@ async function initExecute(params, ctx) {
   }
   state.taskGroupId = args.task_group_id;
   await writeState(ctx.worktree, state);
-  return args.recovery ? `编排会话已初始化。已恢复到 ${args.recovery.phase} 阶段。` : "编排会话已初始化。";
+  const parts = ["编排会话已初始化。"];
+  if (args.recovery)
+    parts.push(`已恢复到 ${args.recovery.phase} 阶段。`);
+  if (modeSwitchNote)
+    parts.push(modeSwitchNote);
+  return parts.join("");
 }
 async function bindWorktreeRefs(item, worktreePath, branch, baseBranch, opts = {}) {
   item.metadata["worktree_path"] = worktreePath;
@@ -36848,7 +36875,7 @@ var orchInitSchema = {
     mode: {
       type: "string",
       enum: ["full", "simple"],
-      description: "流程模式选择：full=完整流程（analyze→implement→三重审查+收尾验证）；simple=精简流程（implement→quality_review→done，缺省）。仅新建编排状态（首次 opx_orch_init）时生效；已开始的变更沿用固化模式，不支持中途切换。"
+      description: "流程模式选择：full=完整流程（analyze→implement→三重审查+收尾验证）；simple=精简流程（implement→quality_review→done，缺省）。首次新建编排状态时固化；已开始的变更仅在允许窗口内可更新：切换任务组（其他任务组均已完成或从未激活）或 recovery.phase=task_analysis 重制当前组（其他任务组同样须已完成或从未激活）；其余场景传不同 mode 将报错。"
     }
   },
   required: ["change_id", "task_group_id"],
@@ -37040,7 +37067,7 @@ function jsonSchemaToZod(schema2) {
 var AGENT_ARG = "_agent";
 var TOOL_SPECS = {
   opx_orch_init: {
-    description: "初始化编排会话。传入变更 ID 和任务组 ID，工具自动解析 tasks.md 提取全部任务组并解析目标组子任务。可通过 recovery 参数恢复到指定阶段。无 recovery 重复初始化当前任务组时保留其阶段和进度；切换到其它任务组时初始化该组。可选 mode 参数（full/simple，缺省 simple）选择流程模式，仅新建状态生效。",
+    description: "初始化编排会话。传入变更 ID 和任务组 ID，工具自动解析 tasks.md 提取全部任务组并解析目标组子任务。可通过 recovery 参数恢复到指定阶段。无 recovery 重复初始化当前任务组时保留其阶段和进度；切换到其它任务组时初始化该组。可选 mode 参数（full/simple，缺省 simple）选择流程模式：首次新建状态时固化；已开始的变更仅切组（其他任务组均已完成或从未激活）或 recovery.phase=task_analysis 重制当前组（其他任务组同样须已完成或从未激活）时可更新，其余场景传不同 mode 报错。",
     schema: orchInitSchema,
     execute: (args, ctx) => initExecute(args, ctx)
   },
@@ -37100,7 +37127,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.126.0";
+var PKG_VERSION = "0.127.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
