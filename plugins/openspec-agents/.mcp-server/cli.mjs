@@ -29434,6 +29434,9 @@ function agentToReviewLayer(agent) {
     return "quality";
   return;
 }
+function isReviewerFamily(agent) {
+  return agent === "openspec-architect" || agentToReviewLayer(agent) !== undefined;
+}
 function readIssueSource(child) {
   return typeof child.metadata["source"] === "string" ? child.metadata["source"] : undefined;
 }
@@ -29718,6 +29721,39 @@ async function reconcileMainPollution(mainRepo, worktreePath, opts) {
       await runGitChecked(mainRepo, ["restore", "--staged", "--worktree", "--", changeDir]);
     }
   }
+}
+async function autoCommitWorktreeChanges(wtPath, agent, stepId) {
+  const statusRes = await runGitChecked(wtPath, ["status", "--porcelain"]);
+  if (!statusRes.success) {
+    return { status: "failed", files: [], untrackedFiles: [], stderr: statusRes.stderr };
+  }
+  const files = [];
+  const untrackedFiles = [];
+  for (const line of statusRes.stdout.split(`
+`).map((l) => l.trim()).filter(Boolean)) {
+    const path2 = parsePorcelainPaths(line)[0];
+    if (!path2 || path2.startsWith("openspec/states/"))
+      continue;
+    if (line.startsWith("??"))
+      untrackedFiles.push(path2);
+    else
+      files.push(path2);
+  }
+  if (files.length === 0)
+    return { status: "skipped", files: [], untrackedFiles };
+  const addResult = await runGitChecked(wtPath, ["add", "-u", "--", ".", ":(exclude)openspec/states"]);
+  if (!addResult.success) {
+    return { status: "failed", files, untrackedFiles, stderr: addResult.stderr };
+  }
+  const commitResult = await runGitChecked(wtPath, [
+    "commit",
+    "-m",
+    `docs(opx): direct fixes by ${agent} (${stepId})`
+  ]);
+  if (!commitResult.success) {
+    return { status: "failed", files, untrackedFiles, stderr: commitResult.stderr };
+  }
+  return { status: "committed", files, untrackedFiles };
 }
 
 // src/core/state.ts
@@ -36581,6 +36617,18 @@ async function agentSubmitExecute(params, ctx) {
       exemptIds: params.exempt_issue_ids,
       newChildren: accepted
     });
+    const autoCommitLines = [];
+    if (isReviewerFamily(ctx.agent)) {
+      const ac = await autoCommitWorktreeChanges(wtPath, ctx.agent, params.step_id);
+      if (ac.status === "committed") {
+        autoCommitLines.push(`- ✅ worktree 直改修正已自动提交（${ac.files.length} 个文件，commit message: \`docs(opx): direct fixes by ${ctx.agent} (${params.step_id})\`）`);
+      } else if (ac.status === "failed") {
+        autoCommitLines.push(`- ⚠️ worktree 直改修正自动提交失败：${ac.stderr || "未知错误"}。请编排者安排补提交（worktree 内 git add -u 后 commit）`);
+      }
+      if (ac.untrackedFiles.length > 0) {
+        autoCommitLines.push(`- ⚠️ 存在未跟踪新建文件未纳入自动提交（须纳入版本控制时由编排者/开发者处理）：${ac.untrackedFiles.join("、")}`);
+      }
+    }
     if (stepPhase === "todo" && params.step_id === "analyze" && params.verdict === "passed" && wtPath && typeof item.metadata["branch_name"] === "string") {
       const baseRef = typeof item.metadata["base_ref"] === "string" ? item.metadata["base_ref"] : null;
       await reconcileMainPollution(ctx.worktree, wtPath, {
@@ -36597,7 +36645,17 @@ async function agentSubmitExecute(params, ctx) {
       await writeDismissedExemption(ctx.worktree, child, { changeId: state.changeId, exemptedBy: ctx.agent });
     }
     await writeState(ctx.worktree, state);
-    return SUBMIT_OK_MESSAGE;
+    if (autoCommitLines.length === 0)
+      return SUBMIT_OK_MESSAGE;
+    return [
+      `## ✅ ${SUBMIT_OK_MESSAGE}`,
+      "",
+      "### worktree 自动提交",
+      "",
+      ...autoCommitLines,
+      ""
+    ].join(`
+`);
   } finally {
     releaseLock(lockPath);
   }
@@ -37127,7 +37185,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.127.0";
+var PKG_VERSION = "0.128.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {

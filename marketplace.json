@@ -9,7 +9,7 @@
       "name": "openspec-agents",
       "source": "./plugins/openspec-agents",
       "description": "OpenSpec change orchestration for AI coding agents: turn OpenSpec change specs into reviewed, high-quality code.",
-      "version": "0.127.0"
+      "version": "0.128.0"
     }
   ]
 }
