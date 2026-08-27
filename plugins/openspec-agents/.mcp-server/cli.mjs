@@ -29686,6 +29686,7 @@ var EMPTY_COMPLETION_RESULT = {
 
 // src/core/tools/lifecycle.ts
 import path6 from "path";
+import { rmdir } from "node:fs/promises";
 
 // src/core/types.ts
 var CODE_DIMENSIONS = ["style", "architecture", "performance", "security", "maintainability"];
@@ -29742,7 +29743,15 @@ function reviewLayerFromMetadata(child) {
 // src/core/git.ts
 import path from "path";
 import { execFile } from "node:child_process";
-import { readFile, writeFile, stat } from "node:fs/promises";
+import { readFile, writeFile, stat, rm } from "node:fs/promises";
+async function pathExists(p) {
+  try {
+    await stat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
 function execGit(args) {
   return new Promise((resolve) => {
     const child = execFile("git", args, { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
@@ -29774,6 +29783,55 @@ async function runGit(worktree, args) {
 }
 async function runGitChecked(worktree, args) {
   return gitRunner.runChecked(worktree, args);
+}
+async function removeTaskGroupWorktree(repoRoot, wtPath, opts = {}) {
+  const result = { dirResolved: false, dirResolvedByFallback: false, pruned: false, branchDeleted: null, errors: [] };
+  if (!await pathExists(wtPath)) {
+    const pruneRes = await runGitChecked(repoRoot, ["worktree", "prune"]);
+    if (pruneRes.success)
+      result.pruned = true;
+    else
+      result.errors.push(`worktree prune 失败：${pruneRes.stderr}`);
+    result.dirResolved = true;
+  } else {
+    const rmRes = await runGitChecked(repoRoot, ["worktree", "remove", wtPath, "--force"]);
+    if (!rmRes.success)
+      result.errors.push(`git worktree remove 失败：${rmRes.stderr}`);
+    if (await pathExists(wtPath)) {
+      try {
+        await rm(wtPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      } catch (e) {
+        result.errors.push(`文件系统兜底删除 "${wtPath}" 失败：${e instanceof Error ? e.message : String(e)}`);
+      }
+      const pruneRes = await runGitChecked(repoRoot, ["worktree", "prune"]);
+      if (pruneRes.success)
+        result.pruned = true;
+      else
+        result.errors.push(`worktree prune 失败：${pruneRes.stderr}`);
+      if (!await pathExists(wtPath)) {
+        result.dirResolved = true;
+        result.dirResolvedByFallback = true;
+      }
+    } else {
+      result.dirResolved = true;
+    }
+  }
+  if (!result.dirResolved) {
+    if (opts.branchName) {
+      result.errors.push(`目录 "${wtPath}" 未能删除，跳过分支 "${opts.branchName}" 的删除以保留排查线索`);
+    }
+    return result;
+  }
+  if (opts.branchName) {
+    const branchRes = await runGitChecked(repoRoot, ["branch", "-D", opts.branchName]);
+    if (branchRes.success)
+      result.branchDeleted = true;
+    else {
+      result.branchDeleted = false;
+      result.errors.push(`删除分支 "${opts.branchName}" 失败：${branchRes.stderr}`);
+    }
+  }
+  return result;
 }
 async function getCurrentHead(worktree) {
   return runGit(worktree, ["rev-parse", "HEAD"]);
@@ -32695,16 +32753,21 @@ function requireLoader() {
       state.result += _result;
     }
   }
+  function chargeMergeWork(state) {
+    state.totalMergeKeys++;
+    if (state.maxTotalMergeKeys !== -1 && state.totalMergeKeys > state.maxTotalMergeKeys) {
+      throwError(state, "merge keys exceeded maxTotalMergeKeys (" + state.maxTotalMergeKeys + ")");
+    }
+  }
   function mergeMappings(state, destination, source, overridableKeys) {
     if (!common2.isObject(source)) {
       throwError(state, "cannot merge mappings; the provided source object is unacceptable");
     }
+    chargeMergeWork(state);
     const sourceKeys = Object.keys(source);
     for (let index = 0, quantity = sourceKeys.length;index < quantity; index += 1) {
       const key = sourceKeys[index];
-      if (state.maxTotalMergeKeys !== -1 && ++state.totalMergeKeys > state.maxTotalMergeKeys) {
-        throwError(state, "merge keys exceeded maxTotalMergeKeys (" + state.maxTotalMergeKeys + ")");
-      }
+      chargeMergeWork(state);
       if (!_hasOwnProperty.call(destination, key)) {
         setProperty(destination, key, source[key]);
         overridableKeys[key] = true;
@@ -32732,6 +32795,9 @@ function requireLoader() {
     }
     if (keyTag === "tag:yaml.org,2002:merge") {
       if (Array.isArray(valueNode)) {
+        if (valueNode.length > 100) {
+          throwError(state, "abnormal merge sequence size");
+        }
         for (let index = 0, quantity = valueNode.length;index < quantity; index += 1) {
           mergeMappings(state, _result, valueNode[index], overridableKeys);
         }
@@ -36329,13 +36395,15 @@ async function setWorktreeExecute(params, ctx) {
         await bindWorktreeRefs(item, existingPath, branch, state.baseBranch);
         reused = true;
       } else {
-        const rmResult = await runGitChecked(repoRoot, ["worktree", "remove", existingPath, "--force"]);
-        if (!rmResult.success) {
-          throw new Error(`无法清理已有 worktree "${existingPath}"：${rmResult.stderr}`);
-        }
-        const branchRmResult = await runGitChecked(repoRoot, ["branch", "-D", branch]);
-        if (!branchRmResult.success) {
-          throw new Error(`无法清理已有分支 "${branch}"：${branchRmResult.stderr}`);
+        const cleanup = await removeTaskGroupWorktree(repoRoot, existingPath, { branchName: branch });
+        if (!cleanup.dirResolved || cleanup.branchDeleted === false) {
+          const problems = [];
+          if (!cleanup.dirResolved)
+            problems.push(`无法清理已有 worktree "${existingPath}"`);
+          if (cleanup.branchDeleted === false)
+            problems.push(`无法清理已有分支 "${branch}"`);
+          throw new Error(`${problems.join("；")}：${cleanup.errors.join("；") || "原因未知"}
+请手动处理后重试。`);
         }
       }
     }
@@ -36399,6 +36467,19 @@ async function statusExecute(params, ctx) {
   const exemptionItems = (await readExemptions(ctx.worktree)).items;
   return renderWorkflowStatusView(item, workflow, rec, { agent, orchestrator: ctx.orchestrator, identityDeclared: ctx.identityDeclared }, { state, tg, mainPollution, toolChanges, exemptedHits, exemptionItems });
 }
+async function sweepEmptyWorktreeParents(repoRoot, removedDir, changeId) {
+  const repoRootAbs = path6.resolve(repoRoot);
+  const groupLevelDir = path6.join(repoRootAbs, ".worktree", changeId);
+  const worktreeLevelDir = path6.join(repoRootAbs, ".worktree");
+  if (path6.dirname(path6.resolve(removedDir)) === groupLevelDir) {
+    try {
+      await rmdir(groupLevelDir);
+    } catch {}
+  }
+  try {
+    await rmdir(worktreeLevelDir);
+  } catch {}
+}
 async function completeTaskGroupExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_complete_task_group");
   const state = await readStateByWorktree(ctx.worktree, params.change_id);
@@ -36453,17 +36534,42 @@ async function completeTaskGroupExecute(params, ctx) {
 `);
     }
   }
-  if (worktreePath && branchName) {
-    try {
-      await runGit(ctx.worktree, ["worktree", "remove", worktreePath, "--force"]);
-      await runGit(ctx.worktree, ["branch", "-D", branchName]);
-    } catch {}
+  let cleanupNote = "";
+  let cleanupResidualWarning = "";
+  if (worktreePath) {
+    const cleanup = await removeTaskGroupWorktree(ctx.worktree, worktreePath, { branchName });
+    if (cleanup.dirResolved) {
+      await sweepEmptyWorktreeParents(ctx.worktree, worktreePath, params.change_id);
+      const successNotes = [];
+      if (cleanup.dirResolvedByFallback) {
+        successNotes.push("- **cleanup**: git worktree remove 未直接移除目录，已按文件系统兜底删除并 prune 管理记录。");
+      }
+      if (cleanup.errors.length > 0) {
+        successNotes.push(`- **cleanup 部分告警**: ${cleanup.errors.join("；")}`);
+      }
+      cleanupNote = successNotes.join(`
+`);
+    } else {
+      item.metadata["cleanup_residual"] = { worktree_path: worktreePath, errors: cleanup.errors };
+      cleanupResidualWarning = [
+        "",
+        "## ⚠️ worktree 清理残留（不影响收尾）",
+        `- **残留路径**: \`${worktreePath}\``,
+        "- **原因**:",
+        ...cleanup.errors.map((e) => `  - ${e}`),
+        `- **处理**: 请人工执行 \`rm -rf '${worktreePath}' && git worktree prune\` 清理残留目录与 git 管理记录。`,
+        branchName ? `- **分支**: 分支 "${branchName}" 未删除。` : ""
+      ].filter(Boolean).join(`
+`);
+    }
   }
   item.metadata["completed_at"] = new Date().toISOString();
   await writeState(ctx.worktree, state);
   const doneMessage = `任务组已完成并合并到 "${mergeTarget}"。`;
-  return checkboxWarning ? `${doneMessage}
-${checkboxWarning}` : doneMessage;
+  const notes = [cleanupNote, checkboxWarning, cleanupResidualWarning].filter(Boolean);
+  return notes.length > 0 ? `${doneMessage}
+${notes.join(`
+`)}` : doneMessage;
 }
 async function setUnattendedExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_set_unattended");
@@ -37507,7 +37613,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.130.0";
+var PKG_VERSION = "0.131.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
