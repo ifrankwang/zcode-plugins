@@ -29694,6 +29694,7 @@ var REVIEW_DIMENSIONS = [...CODE_DIMENSIONS];
 var BUILD_PHASE_TARGETS = ["task_analysis", "dev_impl", "review"];
 var REVIEW_LAYERS = ["tool", "task", "quality"];
 var REVIEW_VERIFY_STEPS = ["verify_tool", "verify_task", "verify_quality"];
+var SIMPLE_REVIEW_STEPS = ["quality_review"];
 
 // src/core/constants.ts
 var STATE_DIR_NAME = "openspec";
@@ -30119,6 +30120,48 @@ function stepAgentIds(step) {
   return step.agents.map((a) => a.id);
 }
 
+// src/core/task-children.ts
+function taskChildrenOf(item) {
+  return (item.children ?? []).filter((c) => c.type === "task");
+}
+function issueChildrenOf(item) {
+  return (item.children ?? []).filter((c) => c.type === "issue");
+}
+function taskChildById(item, id) {
+  return item.children.find((c) => c.type === "task" && (c.id === id || c.externalId === id)) ?? null;
+}
+function normalizeTaskChildIds(rawIds, item) {
+  const byNumber = new Map;
+  for (const c of taskChildrenOf(item)) {
+    if (c.externalId !== undefined)
+      byNumber.set(c.externalId, c.id);
+  }
+  return rawIds.map((id) => byNumber.get(id) ?? id);
+}
+function phaseToTaskStatus(phase, hasRejectReason) {
+  switch (phase) {
+    case "review":
+      return "submitted";
+    case "done":
+    case "cancelled":
+      return "verified";
+    case "todo":
+      return hasRejectReason ? "rejected" : "open";
+    default:
+      return "open";
+  }
+}
+function taskListOf(item) {
+  return taskChildrenOf(item).map((c) => ({
+    id: c.id,
+    specTrace: typeof c.metadata["specTrace"] === "string" ? c.metadata["specTrace"] : "",
+    title: c.title,
+    status: phaseToTaskStatus(c.phase, c.metadata["reject_reason"] !== undefined),
+    taskNumber: typeof c.externalId === "string" ? c.externalId : "",
+    rejectReason: typeof c.metadata["reject_reason"] === "string" ? c.metadata["reject_reason"] : null
+  }));
+}
+
 // src/core/workflow/engine.ts
 var REVIEW_STEP_TO_LAYER = {
   verify_tool: "tool",
@@ -30501,6 +30544,14 @@ function recommendForItem(item, workflow) {
     }
     const gateBlock = forwardAdvanceBlockReason(item, workflow, current.step);
     if (gateBlock) {
+      if (current.phaseName === "review" && taskChildrenOf(item).some((c) => c.phase === "review")) {
+        return {
+          status: "blocked",
+          stepId: current.step.id,
+          agents: stepAgentIds(current.step),
+          blockedReason: `${gateBlock}需该 step 审查者经 opx_agent_submit 补交 verified_tasks（覆盖全部待验证任务）后推进。`
+        };
+      }
       return {
         status: "blocked",
         stepId: current.step.id,
@@ -30521,48 +30572,6 @@ function recommendForItem(item, workflow) {
     stepId: current.step.id,
     agents
   };
-}
-
-// src/core/task-children.ts
-function taskChildrenOf(item) {
-  return (item.children ?? []).filter((c) => c.type === "task");
-}
-function issueChildrenOf(item) {
-  return (item.children ?? []).filter((c) => c.type === "issue");
-}
-function taskChildById(item, id) {
-  return item.children.find((c) => c.type === "task" && (c.id === id || c.externalId === id)) ?? null;
-}
-function normalizeTaskChildIds(rawIds, item) {
-  const byNumber = new Map;
-  for (const c of taskChildrenOf(item)) {
-    if (c.externalId !== undefined)
-      byNumber.set(c.externalId, c.id);
-  }
-  return rawIds.map((id) => byNumber.get(id) ?? id);
-}
-function phaseToTaskStatus(phase, hasRejectReason) {
-  switch (phase) {
-    case "review":
-      return "submitted";
-    case "done":
-    case "cancelled":
-      return "verified";
-    case "todo":
-      return hasRejectReason ? "rejected" : "open";
-    default:
-      return "open";
-  }
-}
-function taskListOf(item) {
-  return taskChildrenOf(item).map((c) => ({
-    id: c.id,
-    specTrace: typeof c.metadata["specTrace"] === "string" ? c.metadata["specTrace"] : "",
-    title: c.title,
-    status: phaseToTaskStatus(c.phase, c.metadata["reject_reason"] !== undefined),
-    taskNumber: typeof c.externalId === "string" ? c.externalId : "",
-    rejectReason: typeof c.metadata["reject_reason"] === "string" ? c.metadata["reject_reason"] : null
-  }));
 }
 
 // src/core/workflow/submit.ts
@@ -35704,6 +35713,7 @@ function renderAnalyzeBlockers(item) {
 }
 function renderDeveloperChildren(item, ctxAgent, exemptionCtx) {
   const lines = [];
+  lines.push(...renderBlockerTrail(item, BLOCKER_TRAIL_TITLE_DEV));
   const toFix = issueChildrenOf(item).filter((c) => isAgentOwnedIssue(c, ctxAgent));
   if (toFix.length === 0)
     return lines;
@@ -35844,6 +35854,21 @@ function renderToolAdjudicateOnly(item, rec, ctxAgent, exemptedHits, exemptionCt
   return lines.join(`
 `);
 }
+var BLOCKER_TRAIL_TITLE_REVIEW = "## Blocker 留痕（人工/不可验证任务的申报依据）";
+var BLOCKER_TRAIL_TITLE_DEV = "## Blocker 留痕（已处理 blocker 的用户确认，凭记录申报完成）";
+function renderBlockerTrail(item, title) {
+  const resolved = readBlockers(item).filter((b) => b.status === "resolved" && b.userResponse);
+  if (resolved.length === 0)
+    return [];
+  const lines = [title, ""];
+  for (const b of resolved) {
+    lines.push(`- Blocker #${b.id}${b.taskId ? ` | Task #${b.taskId}` : ""} | ${b.category}`);
+    lines.push(`  - 描述：${b.description}`);
+    lines.push(`  - 用户确认：${b.userResponse}`);
+  }
+  lines.push("");
+  return lines;
+}
 function renderTaskChildren(item, ctxAgent, exemptionCtx) {
   const lines = [];
   const pendingTasks = readTasks(item).filter((t) => t.status === "submitted");
@@ -35853,6 +35878,7 @@ function renderTaskChildren(item, ctxAgent, exemptionCtx) {
       lines.push(renderTaskItem(t));
     lines.push("");
   }
+  lines.push(...renderBlockerTrail(item, BLOCKER_TRAIL_TITLE_REVIEW));
   const issues = issueChildrenOf(item);
   const own = issues.filter((c) => isAgentOwnedIssue(c, ctxAgent));
   lines.push(...renderChildrenSection("Issue (待复核)", own, exemptionCtx));
@@ -35881,6 +35907,7 @@ function renderMergedChildren(item, ctxAgent, exemptionCtx) {
       lines.push(renderTaskItem(t));
     lines.push("");
   }
+  lines.push(...renderBlockerTrail(item, BLOCKER_TRAIL_TITLE_REVIEW));
   const issues = issueChildrenOf(item);
   const own = issues.filter((c) => isAgentOwnedIssue(c, ctxAgent));
   lines.push(...renderChildrenSection("Issue (待复核)", own, exemptionCtx));
@@ -36077,6 +36104,9 @@ function applyRecoveryState(item, recovery, parsedTasks, mode) {
           delete item.tags[key];
       }
     }
+    if ((recovery?.reset_steps ?? []).includes("quality_review")) {
+      clearStepTags(item, "quality_review");
+    }
     item.currentStep = "quality_review";
     syncTaskChildren(item, parsedTasks, { defaultStatus: "done" });
     return;
@@ -36146,12 +36176,17 @@ function assertValidRecovery(recovery) {
       throw new Error("reset_steps 与 review_layer 互斥，不可同时使用。");
     }
     if (recovery.reset_steps.length === 0) {
-      throw new Error("reset_steps 不能为空数组，请至少指定一个 verify step。");
+      throw new Error("reset_steps 不能为空数组，请至少指定一个审查 step。");
     }
-    for (const stepId of recovery.reset_steps) {
-      if (!REVIEW_VERIFY_STEPS.includes(stepId)) {
-        throw new Error(`reset_steps 中的 step "${stepId}" 不合法，合法值：${REVIEW_VERIFY_STEPS.join("、")}。传入值："${stepId}"。`);
-      }
+  }
+}
+function assertValidResetStepValues(recovery, mode) {
+  if (!recovery?.reset_steps?.length)
+    return;
+  const valid = mode === "simple" ? SIMPLE_REVIEW_STEPS : REVIEW_VERIFY_STEPS;
+  for (const stepId of recovery.reset_steps) {
+    if (!valid.includes(stepId)) {
+      throw new Error(`reset_steps 中的 step "${stepId}" 不属于当前模式（${mode}）的审查 step，` + `合法值：${valid.join("、")}。传入值："${stepId}"。`);
     }
   }
 }
@@ -36234,6 +36269,7 @@ async function initExecute(params, ctx) {
     state.baseBranch = state.baseBranch || baseBranch;
     state.isolationNamespace = state.isolationNamespace || generateIsolationNamespace(state.changeId);
   }
+  assertValidResetStepValues(args.recovery, state.mode ?? "full");
   for (const group of parsedGroups) {
     const isCurrent = group.id === args.task_group_id;
     const groupTasks = tasksByGroup.get(group.id) ?? [];
@@ -36324,6 +36360,11 @@ async function initExecute(params, ctx) {
     parts.push(`已恢复到 ${args.recovery.phase} 阶段。`);
   if (modeSwitchNote)
     parts.push(modeSwitchNote);
+  if (args.recovery?.review_layer && (state.mode ?? "full") === "simple") {
+    parts.push(`
+
+⚠️ simple 模式无 review 子层（仅 quality_review 单层审查），recovery.review_layer 参数未生效。`);
+  }
   return parts.join("");
 }
 async function bindWorktreeRefs(item, worktreePath, branch, baseBranch, opts = {}) {
@@ -36593,6 +36634,14 @@ function isSupplementOnly(params) {
     return false;
   return (params.fixed_issue_ids?.length ?? 0) === 0 && (params.exempt_issue_ids?.length ?? 0) === 0 && (params.new_children?.length ?? 0) === 0 && (params.verified_tasks?.length ?? 0) === 0 && (params.failed_tasks?.length ?? 0) === 0 && !params.boundary_expansion && (params.validation_steps?.length ?? 0) === 0 && params.test_results === undefined;
 }
+function isTaskVerificationSupplement(params) {
+  if ((params.verified_tasks?.length ?? 0) === 0)
+    return false;
+  return (params.failed_tasks?.length ?? 0) === 0 && (params.new_children?.length ?? 0) === 0 && (params.fixed_issue_ids?.length ?? 0) === 0 && (params.exempt_issue_ids?.length ?? 0) === 0 && (params.exempt_adjudications?.length ?? 0) === 0 && (params.recheck_adjudications?.length ?? 0) === 0 && !params.boundary_expansion && (params.validation_steps?.length ?? 0) === 0 && params.test_results === undefined;
+}
+function isTaskVerifySupplementAllowed(item, params, stepId, agent) {
+  return isTaskVerificationSupplement(params) && getStepVerdict(item, stepId, agent) === "passed" && taskChildrenOf(item).some((c) => c.phase === "review");
+}
 function assertRejectedAdjudicationNotPassed(params) {
   if (params.verdict !== "passed")
     return;
@@ -36708,6 +36757,8 @@ function clearReviewVerificationTags(item) {
 }
 function resetTasksForBlocker(item) {
   for (const child of taskChildrenOf(item)) {
+    if (child.phase === "done")
+      continue;
     child.phase = "todo";
     delete child.metadata["reject_reason"];
   }
@@ -36739,12 +36790,30 @@ function handleAnalyzeParams(item, params) {
 }
 function handleImplementParams(item, params) {
   if (params.blocker) {
+    if (params.blocker_updates?.length) {
+      throw new Error(`不可在同一轮提交中同时上报新 blocker（blocker 参数）与更新旧 blocker（blocker_updates）。
+` + "请分两轮处理：先以 verdict=failed + blocker 上报新阻塞；用户确认后，下一轮再携带 blocker_updates 记录答复并重新提交。");
+    }
     if (params.verdict !== "failed") {
       throw new Error("blocker 参数仅支持 verdict=failed 提交（on_fail 回退 analyze）。");
     }
     addItemBlockers(item, [params.blocker]);
     resetTasksForBlocker(item);
     return;
+  }
+  if (params.blocker_updates?.length) {
+    for (const u of params.blocker_updates) {
+      const blocker = itemBlockers(item).find((b) => b.id === u.blocker_id);
+      if (!blocker)
+        throw new Error(`blocker "${u.blocker_id}" 不存在于 metadata.blockers 中。`);
+      if (blocker.status !== "awaiting_user")
+        throw new Error(`blocker "${u.blocker_id}" 状态不是 awaiting_user，无法更新。`);
+      blocker.userResponse = u.user_response;
+      blocker.status = "resolved";
+    }
+  }
+  if (params.verdict === "passed" && itemBlockers(item).some((b) => b.status !== "resolved")) {
+    throw new Error("存在未解决的 blocker，无法以 passed 提交 implement step。请先通过 blocker_updates 处理全部 blocker。");
   }
   const tasks = taskListOf(item);
   const completed = normalizeTaskChildIds(params.completed_task_ids ?? [], item);
@@ -36767,7 +36836,7 @@ function handleImplementParams(item, params) {
     throw new Error(`以下 task 处于 open/rejected 状态且未在 completed_task_ids 中：
 ` + remaining.map((t) => `- #${t.id}(${t.status}) ${t.title}`).join(`
 `) + `
-请将未完成的 task 列在 completed_task_ids 中，或改用 blocker 上报阻塞。`);
+completed_task_ids 仅申报已完成可供验证的任务；无法完成或人工执行的任务不得虚报，` + `应以 verdict=failed + blocker 上报（task_id 指向该任务），经用户确认后凭 blocker 留痕重新申报。`);
   }
   if (params.self_check_results) {
     item.metadata["self_check_results"] = params.self_check_results;
@@ -36805,7 +36874,7 @@ function assertFailedHasReason(item, params, newChildren, stepId, agent) {
     hasReason = hasNewBlocking || existingBlocking.length > 0;
   } else if (stepId === "quality_review") {
     layerName = "AI 审查层";
-    hasReason = hasNewBlocking || existingBlocking.some((c) => resolveChildIssueFields(c).sourcePhase === "quality");
+    hasReason = (params.failed_tasks?.length ?? 0) > 0 || hasNewBlocking || existingBlocking.some((c) => resolveChildIssueFields(c).sourcePhase === "quality");
   } else {
     const dimension = agentToReviewDimension(agent);
     layerName = dimension ? `AI 审查层(${dimension})` : "AI 审查层";
@@ -36839,7 +36908,8 @@ function handleReviewParams(item, params, newChildren, stepId, opts) {
 ` + `请按已加载质量门类 skill 的必做清单逐项执行并逐项申报结果（completed=true）；` + `确实无法执行的必做项须以结构化 skip_reason 申报降级理由` + `（格式：${SKIP_REASON_FORMAT}）。` + `低成本必做项必须实跑后申报；核验申报仅限 workflow 指令白名单限定的高成本必做项。`);
     }
   }
-  if (params.verified_tasks?.length || params.failed_tasks?.length) {
+  const isTaskVerifyStep = stepId === "verify_task" || stepId === "quality_review";
+  if (params.verified_tasks?.length || params.failed_tasks?.length || params.verdict === "passed" && isTaskVerifyStep) {
     const tasks = taskListOf(item);
     const validIds = new Set(tasks.map((t) => t.id));
     const verified = normalizeTaskChildIds(params.verified_tasks ?? [], item);
@@ -36862,7 +36932,8 @@ function handleReviewParams(item, params, newChildren, stepId, opts) {
     if (uncovered.length > 0) {
       throw new Error(`以下 submitted task 未被 verified_tasks 或 failed_tasks 覆盖：
 ` + uncovered.map((t) => `- #${t.id} ${t.title}`).join(`
-`));
+`) + `
+verified_tasks 用于逐项确认已完成的任务；验证未通过的任务须以 failed_tasks 逐项驳回并设 verdict=failed 回退；` + `人工执行或环境不可验证的任务不得虚报确认，应以 verdict=failed + failed_tasks 驳回，` + `由开发者经 verdict=failed + blocker（task_id 指向该任务）上报、用户确认留痕后凭记录重新申报完成。`);
     }
     for (const id of verified) {
       const child = taskChildById(item, id);
@@ -36939,7 +37010,7 @@ async function agentSubmitExecute(params, ctx) {
       }
     }
     const guardStepPhase = workflow.stepMap.get(params.step_id)?.phase.name;
-    if (guardStepPhase === "review" && getStepVerdict(item, params.step_id, ctx.agent) === "passed" && !isSupplementOnly(params)) {
+    if (guardStepPhase === "review" && getStepVerdict(item, params.step_id, ctx.agent) === "passed" && !isSupplementOnly(params) && !isTaskVerifySupplementAllowed(item, params, params.step_id, ctx.agent)) {
       throw new Error(`重复提交守卫：agent "${ctx.agent}" 已在 step "${params.step_id}" 以 passed 通过，不允许重复提交。`);
     }
     assertRejectedAdjudicationNotPassed(params);
@@ -37009,7 +37080,7 @@ async function agentSubmitExecute(params, ctx) {
       const agentCfg = stepCfg.agents.find((a) => a.id === ctx.agent);
       handleReviewParams(item, params, newChildren, params.step_id, {
         capabilityTags: agentCfg?.capability_tags ?? [],
-        skipMustDoGate: isSupplementOnly(params)
+        skipMustDoGate: isSupplementOnly(params) || isTaskVerifySupplementAllowed(item, params, params.step_id, ctx.agent)
       });
     } else if (stepPhase === "todo") {
       handleAnalyzeParams(item, params);
@@ -37334,8 +37405,8 @@ var recoverySchema = {
     },
     reset_steps: {
       type: "array",
-      description: "重置指定 verify step 的通过标记为 pending（仅 phase=review 时有效，与 review_layer 互斥）。用于已 passed 但被本层遗漏复核/裁定阻塞的 review step 强制重新审查；恢复后 currentStep 落在第一个未全部通过的 verify step，可能早于被重置的 step。",
-      items: { type: "string", enum: ["verify_tool", "verify_task", "verify_quality"] }
+      description: "重置指定审查 step 的通过标记为 pending（仅 phase=review 时有效，与 review_layer 互斥）。用于已 passed 但被本层遗漏复核/裁定/任务验证阻塞的 review step 强制重新审查；恢复后 currentStep 落在第一个未全部通过的审查 step，可能早于被重置的 step。值按模式生效：full 模式合法值为 verify_tool/verify_task/verify_quality，simple 模式合法值为 quality_review；传入不属于当前模式的值会在运行时报错。",
+      items: { type: "string", enum: ["verify_tool", "verify_task", "verify_quality", "quality_review"] }
     }
   },
   required: ["phase"],
@@ -37447,7 +37518,7 @@ var agentSubmitSchema = {
     blockers: { type: "array", description: "analyze step：新增 blocker 列表", items: blockerItem },
     blocker_updates: {
       type: "array",
-      description: "analyze step：按 blocker_id 置 resolved 并记录用户答复",
+      description: "analyze / implement step：按 blocker_id 置 resolved 并记录用户答复（implement 下人工执行任务凭留痕重新申报的依据）",
       items: {
         type: "object",
         properties: {
@@ -37483,12 +37554,12 @@ var agentSubmitSchema = {
     },
     verified_tasks: {
       type: "array",
-      description: "verify_task step：验证通过的 task id",
+      description: "verify_task / quality_review step（任务验证归属层）：逐项确认验证通过的 task id；passed 提交时 submitted task 必须被 verified_tasks/failed_tasks 全覆盖（工具强制门禁），漏带会被拒绝",
       items: { type: "string" }
     },
     failed_tasks: {
       type: "array",
-      description: "verify_task step：验证失败的 task 列表（含原因）",
+      description: "verify_task / quality_review step：验证失败的 task 列表（含原因）",
       items: taskVerifyItem
     }
   },
@@ -37613,7 +37684,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.131.0";
+var PKG_VERSION = "0.132.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
