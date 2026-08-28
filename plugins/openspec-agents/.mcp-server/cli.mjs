@@ -29775,7 +29775,7 @@ var defaultRunner = {
   },
   async runChecked(worktree, args) {
     const { stdout, stderr, exitCode } = await execGit(["-C", worktree, ...args]);
-    return { success: exitCode === 0, stdout: stdout.trim(), stderr: stderr.trim() };
+    return { success: exitCode === 0, stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
   }
 };
 var gitRunner = defaultRunner;
@@ -29890,15 +29890,44 @@ async function markTaskGroupCheckboxesComplete(worktree, changeId, taskGroupId) 
     throw new Error(`git commit tasks.md 失败：${commitResult.stderr}`);
   }
 }
-async function mergeBranchToTarget(worktree, sourceBranch, targetBranch) {
-  const checkoutResult = await runGitChecked(worktree, ["checkout", targetBranch]);
-  if (!checkoutResult.success) {
-    throw new Error(`无法切到目标分支 "${targetBranch}"：${checkoutResult.stderr}`);
+async function mergeBranchToTarget(repoDir, sourceBranch, targetBranch) {
+  const ancestor = await runGitChecked(repoDir, ["merge-base", "--is-ancestor", sourceBranch, targetBranch]);
+  if (ancestor.success)
+    return { success: true, conflict: false };
+  if (ancestor.exitCode !== 1) {
+    throw new Error(`无法判断 "${sourceBranch}" 是否已并入 "${targetBranch}"：${ancestor.stderr}`);
   }
-  const mergeResult = await runGitChecked(worktree, ["merge", "--no-ff", sourceBranch]);
-  if (!mergeResult.success) {
-    await runGitChecked(worktree, ["merge", "--abort"]);
+  const mergeTree = await runGitChecked(repoDir, ["merge-tree", "--write-tree", "--messages", targetBranch, sourceBranch]);
+  if (!mergeTree.success) {
+    if (mergeTree.exitCode !== 1) {
+      throw new Error(`无法试算 "${sourceBranch}" → "${targetBranch}" 的合并：${mergeTree.stderr}`);
+    }
     return { success: false, conflict: true };
+  }
+  const treeOid = mergeTree.stdout.split(`
+`)[0].trim();
+  if (!treeOid)
+    throw new Error("merge-tree 未返回树对象，无法生成合并提交。");
+  const targetOid = (await runGit(repoDir, ["rev-parse", targetBranch])).trim();
+  const sourceOid = (await runGit(repoDir, ["rev-parse", sourceBranch])).trim();
+  if (!targetOid || !sourceOid) {
+    throw new Error(`无法解析分支 OID：target="${targetOid}" source="${sourceOid}"`);
+  }
+  const commitOid = (await runGit(repoDir, [
+    "commit-tree",
+    treeOid,
+    "-p",
+    targetOid,
+    "-p",
+    sourceOid,
+    "-m",
+    `Merge branch '${sourceBranch}'`
+  ])).trim();
+  if (!commitOid)
+    throw new Error("git commit-tree 失败：无法创建合并提交。");
+  const updateRef = await runGitChecked(repoDir, ["update-ref", `refs/heads/${targetBranch}`, commitOid, targetOid]);
+  if (!updateRef.success) {
+    throw new Error(`基础分支 "${targetBranch}" 已被并发推进，合并提交未写入（update-ref 旧值校验失败）：${updateRef.stderr}`);
   }
   return { success: true, conflict: false };
 }
@@ -36569,8 +36598,8 @@ async function completeTaskGroupExecute(params, ctx) {
       return [
         `- **status**: blocked`,
         `- **merge_conflict**: true`,
-        `- **说明**: 合并到 "${mergeTarget}" 时发生冲突，已中止合并。`,
-        `- **处理**: 请手动在目标分支解决冲突后完成合并 (git merge ${branchName})，完成后重新调 opx_orch_complete_task_group 完成收尾。worktree 与分支已保留。`
+        `- **说明**: 合并到 "${mergeTarget}" 时发生冲突，未产生任何变更（分支引用未动，无半成品合并）。`,
+        `- **处理**: 请自行执行 \`git checkout ${mergeTarget} && git merge ${branchName}\` 解决冲突并提交，完成后重新调用 opx_orch_complete_task_group 完成收尾（重调时工具会自动识别已合并并继续）。worktree 与分支已保留。`
       ].join(`
 `);
     }
@@ -37684,7 +37713,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.132.0";
+var PKG_VERSION = "0.132.1";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
