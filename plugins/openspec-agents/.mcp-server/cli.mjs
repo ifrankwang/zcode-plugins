@@ -34095,7 +34095,7 @@ function reviewLayerFromMetadata(child) {
 // src/core/git.ts
 import path from "path";
 import { execFile } from "node:child_process";
-import { readFile, writeFile, stat, rm } from "node:fs/promises";
+import { readFile, writeFile, stat, rm, realpath } from "node:fs/promises";
 async function pathExists(p) {
   try {
     await stat(p);
@@ -34251,13 +34251,53 @@ async function markTaskGroupCheckboxesComplete(worktree, changeId, taskGroupId) 
   }
 }
 async function mergeBranchToTarget(repoDir, sourceBranch, targetBranch) {
-  const ancestor = await runGitChecked(repoDir, ["merge-base", "--is-ancestor", sourceBranch, targetBranch]);
+  const mainRepo = await resolveMainRepoRoot(repoDir) ?? repoDir;
+  const ancestor = await runGitChecked(mainRepo, ["merge-base", "--is-ancestor", sourceBranch, targetBranch]);
   if (ancestor.success)
     return { success: true, conflict: false };
   if (ancestor.exitCode !== 1) {
     throw new Error(`无法判断 "${sourceBranch}" 是否已并入 "${targetBranch}"：${ancestor.stderr}`);
   }
-  const mergeTree = await runGitChecked(repoDir, ["merge-tree", "--write-tree", "--messages", targetBranch, sourceBranch]);
+  const checkedOutPath = await findWorktreeCheckingOut(mainRepo, targetBranch);
+  if (checkedOutPath) {
+    if (!await sameDir(checkedOutPath, mainRepo)) {
+      return {
+        success: false,
+        conflict: false,
+        blockedMessage: [
+          `- **原因**: 目标分支 \`${targetBranch}\` 正被工作树 \`${checkedOutPath}\` 检出；自动推进分支指针会使该工作树的暂存区/工作区与分支引用失步，本次未执行任何合并动作。`,
+          `- **处理**: 请在该工作树手动执行 \`git merge ${sourceBranch}\`，或移除该工作树（\`git worktree remove ${checkedOutPath}\`）后重试。`
+        ].join(`
+`)
+      };
+    }
+    const status = await runGit(mainRepo, ["status", "--porcelain"]);
+    if (status.trim().length > 0) {
+      return {
+        success: false,
+        conflict: false,
+        blockedMessage: [
+          `- **原因**: 目标分支 \`${targetBranch}\` 正被主仓库检出，且主仓库存在未提交改动；为避免覆盖本地改动，本次未执行任何合并动作（分支引用未动、无半成品）。`,
+          `- **处理**: 请先 commit 或 stash 主仓库改动后重试；或自行执行 \`git merge ${sourceBranch}\`（真实合并自带脏工作区保护）。`
+        ].join(`
+`)
+      };
+    }
+    const mergeTree2 = await runGitChecked(mainRepo, ["merge-tree", "--write-tree", "--messages", targetBranch, sourceBranch]);
+    if (!mergeTree2.success) {
+      if (mergeTree2.exitCode !== 1) {
+        throw new Error(`无法试算 "${sourceBranch}" → "${targetBranch}" 的合并：${mergeTree2.stderr}`);
+      }
+      return { success: false, conflict: true };
+    }
+    const mergeResult = await runGitChecked(mainRepo, ["merge", "--no-ff", sourceBranch]);
+    if (!mergeResult.success) {
+      await runGitChecked(mainRepo, ["merge", "--abort"]);
+      return { success: false, conflict: true };
+    }
+    return { success: true, conflict: false };
+  }
+  const mergeTree = await runGitChecked(mainRepo, ["merge-tree", "--write-tree", "--messages", targetBranch, sourceBranch]);
   if (!mergeTree.success) {
     if (mergeTree.exitCode !== 1) {
       throw new Error(`无法试算 "${sourceBranch}" → "${targetBranch}" 的合并：${mergeTree.stderr}`);
@@ -34268,12 +34308,12 @@ async function mergeBranchToTarget(repoDir, sourceBranch, targetBranch) {
 `)[0].trim();
   if (!treeOid)
     throw new Error("merge-tree 未返回树对象，无法生成合并提交。");
-  const targetOid = (await runGit(repoDir, ["rev-parse", targetBranch])).trim();
-  const sourceOid = (await runGit(repoDir, ["rev-parse", sourceBranch])).trim();
+  const targetOid = (await runGit(mainRepo, ["rev-parse", targetBranch])).trim();
+  const sourceOid = (await runGit(mainRepo, ["rev-parse", sourceBranch])).trim();
   if (!targetOid || !sourceOid) {
     throw new Error(`无法解析分支 OID：target="${targetOid}" source="${sourceOid}"`);
   }
-  const commitOid = (await runGit(repoDir, [
+  const commitOid = (await runGit(mainRepo, [
     "commit-tree",
     treeOid,
     "-p",
@@ -34285,7 +34325,7 @@ async function mergeBranchToTarget(repoDir, sourceBranch, targetBranch) {
   ])).trim();
   if (!commitOid)
     throw new Error("git commit-tree 失败：无法创建合并提交。");
-  const updateRef = await runGitChecked(repoDir, ["update-ref", `refs/heads/${targetBranch}`, commitOid, targetOid]);
+  const updateRef = await runGitChecked(mainRepo, ["update-ref", `refs/heads/${targetBranch}`, commitOid, targetOid]);
   if (!updateRef.success) {
     throw new Error(`基础分支 "${targetBranch}" 已被并发推进，合并提交未写入（update-ref 旧值校验失败）：${updateRef.stderr}`);
   }
@@ -34335,14 +34375,44 @@ function parsePorcelainPaths(out) {
     return f.replace(/^"+|"+$/g, "");
   });
 }
-async function detectMainRepoPollution(worktreePath) {
-  let repoRoot;
+async function resolveMainRepoRoot(worktreePath) {
   try {
     const st = await stat(path.join(worktreePath, ".git"));
-    repoRoot = st.isDirectory() ? worktreePath : await discoverRepoRoot(worktreePath);
+    return st.isDirectory() ? worktreePath : await discoverRepoRoot(worktreePath);
   } catch {
     return null;
   }
+}
+async function sameDir(a, b) {
+  try {
+    return await realpath(a) === await realpath(b);
+  } catch {
+    return path.resolve(a) === path.resolve(b);
+  }
+}
+async function findWorktreeCheckingOut(repoRoot, branch) {
+  const out = await runGit(repoRoot, ["worktree", "list", "--porcelain"]);
+  for (const block of out.split(`
+
+`)) {
+    let wtPath = "";
+    let wtBranch = "";
+    for (const line of block.split(`
+`)) {
+      if (line.startsWith("worktree "))
+        wtPath = line.slice("worktree ".length).trim();
+      else if (line.startsWith("branch "))
+        wtBranch = line.slice("branch ".length).trim();
+    }
+    if (wtPath && wtBranch === `refs/heads/${branch}`)
+      return wtPath;
+  }
+  return null;
+}
+async function detectMainRepoPollution(worktreePath) {
+  const repoRoot = await resolveMainRepoRoot(worktreePath);
+  if (!repoRoot)
+    return null;
   let out;
   try {
     out = await runGit(repoRoot, ["status", "--porcelain", "--", "openspec/"]);
@@ -41359,6 +41429,10 @@ async function completeTaskGroupExecute(params, ctx) {
   const mergeTarget = state.baseBranch;
   if (branchName && !isReviewNone) {
     const mergeResult = await mergeBranchToTarget(ctx.worktree, branchName, mergeTarget);
+    if (mergeResult.blockedMessage) {
+      return [`- **status**: blocked`, mergeResult.blockedMessage].join(`
+`);
+    }
     if (!mergeResult.success) {
       return [
         `- **status**: blocked`,
@@ -42519,7 +42593,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.133.0";
+var PKG_VERSION = "0.133.1";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
