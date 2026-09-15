@@ -21715,6 +21715,45 @@ async function markTaskGroupCheckboxesComplete(worktree, changeId, taskGroupId) 
     throw new Error(`git commit tasks.md 失败：${commitResult.stderr}`);
   }
 }
+function unquotePath(p) {
+  const t = p.trim();
+  return t.startsWith('"') && t.endsWith('"') && t.length >= 2 ? t.slice(1, -1) : t;
+}
+function parseStatusEntries(out) {
+  const entries = [];
+  for (const raw of out.split(`
+`)) {
+    if (raw.length < 4)
+      continue;
+    let line = raw;
+    if (line[2] !== " ") {
+      if (line[1] !== " ")
+        continue;
+      line = ` ${line}`;
+    }
+    if (line[0] === " " && line[1] === " ")
+      continue;
+    const pathPart = line.slice(3);
+    const arrow = pathPart.indexOf(" -> ");
+    const paths = arrow >= 0 ? [unquotePath(pathPart.slice(0, arrow)), unquotePath(pathPart.slice(arrow + 4))] : [unquotePath(pathPart)];
+    if (paths.every((p) => p !== ""))
+      entries.push({ x: line[0], y: line[1], paths });
+  }
+  return entries;
+}
+function parseDiffNameOnly(out) {
+  return out.split(`
+`).map(unquotePath).filter(Boolean);
+}
+function pathsOverlap(a, b) {
+  const na = a.replace(/\/+$/, "");
+  const nb = b.replace(/\/+$/, "");
+  if (!na || !nb)
+    return false;
+  if (na === nb)
+    return true;
+  return na.startsWith(`${nb}/`) || nb.startsWith(`${na}/`);
+}
 async function mergeBranchToTarget(repoDir, sourceBranch, targetBranch) {
   const mainRepo = await resolveMainRepoRoot(repoDir) ?? repoDir;
   const ancestor = await runGitChecked(mainRepo, ["merge-base", "--is-ancestor", sourceBranch, targetBranch]);
@@ -21736,24 +21775,71 @@ async function mergeBranchToTarget(repoDir, sourceBranch, targetBranch) {
 `)
       };
     }
-    const status = await runGit(mainRepo, ["status", "--porcelain"]);
-    if (status.trim().length > 0) {
-      return {
-        success: false,
-        conflict: false,
-        blockedMessage: [
-          `- **原因**: 目标分支 \`${targetBranch}\` 正被主仓库检出，且主仓库存在未提交改动；为避免覆盖本地改动，本次未执行任何合并动作（分支引用未动、无半成品）。`,
-          `- **处理**: 请先 commit 或 stash 主仓库改动后重试；或自行执行 \`git merge ${sourceBranch}\`（真实合并自带脏工作区保护）。`
-        ].join(`
-`)
-      };
-    }
     const mergeTree = await runGitChecked(mainRepo, ["merge-tree", "--write-tree", "--messages", targetBranch, sourceBranch]);
     if (!mergeTree.success) {
       if (mergeTree.exitCode !== 1) {
         throw new Error(`无法试算 "${sourceBranch}" → "${targetBranch}" 的合并：${mergeTree.stderr}`);
       }
       return { success: false, conflict: true };
+    }
+    const mergedTreeOid = mergeTree.stdout.split(`
+`)[0].trim();
+    const statusRes = await runGitChecked(mainRepo, ["status", "--porcelain"]);
+    if (!statusRes.success) {
+      throw new Error(`无法读取主仓库工作区状态：${statusRes.stderr}`);
+    }
+    const entries = parseStatusEntries(statusRes.stdout);
+    if (entries.length > 0) {
+      const dirtyPaths = [...new Set(entries.flatMap((e) => e.paths))];
+      const written = parseDiffNameOnly(await runGit(mainRepo, ["diff", "--name-only", "--no-renames", targetBranch, mergedTreeOid]));
+      const overlap = written.filter((w) => dirtyPaths.some((d) => pathsOverlap(d, w)));
+      if (overlap.length > 0) {
+        return {
+          success: false,
+          conflict: false,
+          blockedMessage: [
+            `- **原因**: 目标分支 \`${targetBranch}\` 正被主仓库检出，且以下本地改动文件与任务组合并将写入的文件重合；为避免覆盖本地改动，本次未执行任何合并动作（分支引用未动、无半成品）：`,
+            ...overlap.map((f) => `  - \`${f}\``),
+            `- **处理**: 请先 commit/stash/移除上述文件的本地改动后重试；或自行执行 \`git merge ${sourceBranch}\`（真实合并自带脏工作区保护）。`
+          ].join(`
+`)
+        };
+      }
+      const stagedPaths = [...new Set(entries.filter((e) => e.x !== " " && e.x !== "?").flatMap((e) => e.paths))];
+      if (stagedPaths.length > 0) {
+        const unstagedDelta = await runGit(mainRepo, ["diff", "--name-only", "--", ...stagedPaths]);
+        if (parseDiffNameOnly(unstagedDelta).length > 0) {
+          return {
+            success: false,
+            conflict: false,
+            blockedMessage: [
+              `- **原因**: 主仓库存在部分暂存文件（同一文件既有已暂存又有未暂存改动），自动合并会改变暂存粒度；本次未执行任何合并动作（分支引用未动、无半成品）。`,
+              `- **处理**: 请先 commit 或 stash，或补全/取消暂存后重试；或自行执行 \`git merge ${sourceBranch}\`。`
+            ].join(`
+`)
+          };
+        }
+        let unstagedByUs = false;
+        try {
+          const restore = await runGitChecked(mainRepo, ["restore", "--staged", "--", ...stagedPaths]);
+          if (!restore.success)
+            throw new Error(`git restore --staged 失败（未执行合并）：${restore.stderr}`);
+          unstagedByUs = true;
+          const mergeResult = await runGitChecked(mainRepo, ["merge", "--no-ff", sourceBranch]);
+          if (!mergeResult.success) {
+            await runGitChecked(mainRepo, ["merge", "--abort"]);
+            return { success: false, conflict: true };
+          }
+          return { success: true, conflict: false };
+        } finally {
+          if (unstagedByUs) {
+            const readd = await runGitChecked(mainRepo, ["add", "--", ...stagedPaths]);
+            if (!readd.success) {
+              throw new Error(`合并后还原暂存态失败（git add）：${readd.stderr}；请人工核对这些文件的暂存状态`);
+            }
+          }
+        }
+      }
     }
     const mergeResult = await runGitChecked(mainRepo, ["merge", "--no-ff", sourceBranch]);
     if (!mergeResult.success) {
@@ -30075,7 +30161,7 @@ var TOOL_SPECS = {
     execute: (args, ctx) => statusExecute({ change_id: args.change_id }, ctx)
   },
   opx_orch_complete_task_group: {
-    description: "完成任务组收尾：合并 task-group 分支到 baseBranch → 清理 worktree 与分支。须在收尾验证（verify_cleanup）通过后调用。合并冲突时中止并返回 blocked（保留 worktree/分支）。",
+    description: "完成任务组收尾：合并 task-group 分支到 baseBranch → 清理 worktree 与分支。须在收尾验证（verify_cleanup）通过后调用。合并冲突、主仓库本地改动文件与合并写入文件重合、或存在部分暂存文件时中止并返回 blocked（保留 worktree/分支）；主仓库无关脏文件不阻塞合并。",
     schema: completeTaskGroupSchema,
     execute: (args, ctx) => completeTaskGroupExecute(args, ctx)
   },
@@ -30120,7 +30206,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.134.0";
+var PKG_VERSION = "0.135.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
