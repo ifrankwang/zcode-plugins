@@ -4056,13 +4056,14 @@ var require_fast_uri = __commonJS(function(exports, module) {
       if (!malformedIPLiteral) {
         malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP);
       }
-      if (!schemeHandler || schemeHandler && !schemeHandler.skipNormalize) {
-        if (uri.indexOf("%") !== -1) {
-          if (parsed.host !== undefined && !malformedIPLiteral) {
-            const host = isIP ? parsed.host : normalizePercentEncoding(parsed.host, true);
-            parsed.host = reescapeHostDelimiters(host, isIP);
-          }
+      if (uri.indexOf("%") !== -1 && parsed.host !== undefined && !malformedIPLiteral) {
+        let host = isIP ? parsed.host : normalizePercentEncoding(parsed.host, true);
+        if (!isIP) {
+          host = normalizePercentEncoding(host.toLowerCase());
         }
+        parsed.host = reescapeHostDelimiters(host, isIP);
+      }
+      if (!schemeHandler || schemeHandler && !schemeHandler.skipNormalize) {
         if (parsed.path) {
           parsed.path = normalizePathEncoding(parsed.path);
         }
@@ -30206,7 +30207,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.135.0";
+var PKG_VERSION = "0.136.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
