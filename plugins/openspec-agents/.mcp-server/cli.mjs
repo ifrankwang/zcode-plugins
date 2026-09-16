@@ -21663,6 +21663,14 @@ async function getCurrentBranch(worktree) {
 async function getMergeBase(worktree, baseBranch) {
   return runGit(worktree, ["merge-base", "HEAD", baseBranch]);
 }
+async function isAncestor(worktree, a, b) {
+  const r = await runGitChecked(worktree, ["merge-base", "--is-ancestor", a, b]);
+  if (r.success)
+    return true;
+  if (r.exitCode === 1)
+    return false;
+  throw new Error(`无法判断 "${a}" 是否为 "${b}" 的祖先：${r.stderr}`);
+}
 async function isLocalBranch(worktree, branch) {
   const r = await runGitChecked(worktree, ["rev-parse", "--verify", `refs/heads/${branch}`]);
   return r.success;
@@ -21799,7 +21807,7 @@ async function mergeBranchToTarget(repoDir, sourceBranch, targetBranch) {
           success: false,
           conflict: false,
           blockedMessage: [
-            `- **原因**: 目标分支 \`${targetBranch}\` 正被主仓库检出，且以下本地改动文件与任务组合并将写入的文件重合；为避免覆盖本地改动，本次未执行任何合并动作（分支引用未动、无半成品）：`,
+            `- **原因**: 目标分支 \`${targetBranch}\` 正被主仓库检出，且以下本地改动文件与变更分支合并将写入的文件重合；为避免覆盖本地改动，本次未执行任何合并动作（分支引用未动、无半成品）：`,
             ...overlap.map((f) => `  - \`${f}\``),
             `- **处理**: 请先 commit/stash/移除上述文件的本地改动后重试；或自行执行 \`git merge ${sourceBranch}\`（真实合并自带脏工作区保护）。`
           ].join(`
@@ -21883,6 +21891,7 @@ async function mergeBranchToTarget(repoDir, sourceBranch, targetBranch) {
   }
   return { success: true, conflict: false };
 }
+var RESTORABLE_WORKTREE_BRANCH_PREFIXES = ["change/", "review/", "task-group/"];
 async function discoverDiskWorktrees(worktree) {
   const result = [];
   const wtList = await runGit(worktree, ["worktree", "list"]);
@@ -21891,7 +21900,7 @@ async function discoverDiskWorktrees(worktree) {
     const m = line.match(/^(\S+)\s+[0-9a-f]+\s+\[(.+?)\]/);
     if (m) {
       const branch = m[2].trim();
-      if (branch.startsWith("task-group/") || branch.startsWith("review/")) {
+      if (RESTORABLE_WORKTREE_BRANCH_PREFIXES.some((p) => branch.startsWith(p))) {
         result.push({ branch, path: m[1].trim() });
       }
     }
@@ -22194,6 +22203,9 @@ function isTaskGroupSettled(item) {
   const noTags = Object.keys(item.tags).length === 0;
   const childrenSettled = item.children.filter((c) => c.type === "task").every((c) => c.phase === "todo" || isTerminalPhase(c.phase));
   return noTags && childrenSettled;
+}
+function isFinalTaskGroup(state, item) {
+  return state.workItems.filter((w) => w.id.startsWith("task:") && w.id !== item.id).every(isTaskGroupSettled);
 }
 function isBlockingSeverity(severity) {
   return severity !== undefined && BLOCKING_SEVERITIES.includes(severity);
@@ -27032,7 +27044,7 @@ function renderWorktreeSection(state, tg, opts) {
         lines.push("- **审查范围**: 全量代码库审查（无区间界定，工具检查与审查覆盖整个代码库）");
       }
     } else if (tg.baseRef) {
-      lines.push(`- **变更范围**: 用 \`git -C ${tg.worktreePath} diff --name-only ${tg.baseRef}..HEAD\` 查询本 change 全部已提交变更文件`);
+      lines.push(`- **变更范围**: 用 \`git -C ${tg.worktreePath} diff --name-only ${tg.baseRef}..HEAD\` 查询本任务组的已提交变更文件`);
     }
     lines.push("- **⚠️ 约束**: 所有读写和 git 操作均在此目录下进行；严禁直接修改主仓库/主分支路径下的文件（如 `<repo>/openspec/...`）");
     lines.push("- **路径解析**: 推荐阅读文档均为相对 worktree 路径的引用，一律以 worktree 路径为基准解析，禁止从主仓库根目录解析");
@@ -27348,13 +27360,14 @@ function renderTerminalPhase(item, state, caller) {
     return lines.join(`
 `);
   }
+  const finalGroup = state ? isFinalTaskGroup(state, item) : true;
   if (item.metadata["completed_at"] !== undefined) {
     return [
       "# ✅ 任务组已完成",
       "",
       `- **完成时间**: ${item.metadata["completed_at"]}`,
       "",
-      "编排已完成并收尾。",
+      finalGroup ? "本任务组为最后一个收口任务组，change 收口已完成：变更分支已合并回基准分支，编排已完成并收尾。" : "本任务组已完成，变更保留在 change 分支上，待全部任务组完成后统一收口合并。",
       "",
       ...renderDeploymentNotesSection(state, caller)
     ].join(`
@@ -27363,7 +27376,8 @@ function renderTerminalPhase(item, state, caller) {
   return [
     "# \uD83C\uDFC1 任务组已完成，待收尾",
     "",
-    "全部审核层已通过。调用 `opx_orch_complete_task_group` 合并分支并完成收尾。",
+    "全部审核层已通过。",
+    finalGroup ? "调用 `opx_orch_complete_task_group` 完成 change 收口（把变更分支合并回基准分支并清理）。" : "调用 `opx_orch_complete_task_group` 完成任务组收尾（变更保留在 change 分支，统一收口时合并）。",
     "",
     ...renderDeploymentNotesSection(state, caller)
   ].join(`
@@ -27380,7 +27394,7 @@ function renderDeploymentNotesSection(state, caller) {
     "",
     "向用户汇报本次变更的部署注意事项：",
     "",
-    `- 阅读主仓库 \`openspec/changes/${state.changeId}/\` 下规划文档（design.md、tasks.md、proposal.md、specs/）提取部署要点：数据/结构变更脚本执行、消息队列/缓存等中间件配置调整、新增配置项或功能开关、外部接口契约变化`,
+    `- 阅读主仓库 \`openspec/changes/${state.changeId}/\` 下规划文档（design.md、tasks.md、proposal.md、specs/）提取部署要点：数据/结构变更脚本执行、消息队列/缓存等中间件配置调整、新增配置项或功能开关、外部接口契约变化、依赖清单/构建配置变更（合并后需在主仓库重装依赖、重新构建）`,
     "- 无规划文档时跳过文档提取，仅转述下方实施补充点",
     ""
   ];
@@ -27764,7 +27778,7 @@ function renderAgentWorking(item, rec, step, common, ctxAgent, state, tg, toolCh
   lines.push(...eff.lines);
   n = eff.nextNum;
   if (tg.worktreePath && tg.baseRef) {
-    lines.push(`${n++}. 用上方「变更范围」命令获取本 change 全部已提交变更文件清单，作为本次实施/修改范围；审查/报告范围以当前 step 指令为准`);
+    lines.push(`${n++}. 用上方「变更范围」命令获取本任务组的已提交变更文件清单，作为本次实施/修改范围；审查/报告范围以当前 step 指令为准`);
   }
   lines.push(`${n++}. 执行当前 step（\`${rec.stepId}\`）职责范围内的全部工作——遵循所有已加载 skill 的全部规范与约束`);
   lines.push(`${n++}. 逐项检视所有已加载 skill 的 MUST 规范，确认全部满足（不满足则补做，不得跳过）`);
@@ -27977,7 +27991,7 @@ function renderToolChangesEvidence(item, tg, toolChanges, kind) {
 `)];
   }
   if (checkpoint) {
-    lines.push(`- **口径**: 本次为「${label.title}（${checkpoint}..HEAD）」的增量区间（含已提交与未提交的非 openspec 变更）；` + `与上方「变更范围」（${baseRef ?? "(无)"}..HEAD 整个 change 累计口径）不同`, "");
+    lines.push(`- **口径**: 本次为「${label.title}（${checkpoint}..HEAD）」的增量区间（含已提交与未提交的非 openspec 变更）；` + `与上方「变更范围」（${baseRef ?? "(无)"}..HEAD 本任务组累计口径）不同`, "");
   } else if (baseRef) {
     lines.push(`- **口径**: 本次区间以基线（${baseRef}..HEAD）兜底，与上方「变更范围」一致（首次进入，无${label.lastCheck}记录；` + "含已提交与未提交的非 openspec 变更）", "");
   } else {
@@ -28313,7 +28327,16 @@ function applyRecoveryState(item, recovery, parsedTasks, state) {
     if ((recovery?.reset_steps ?? []).includes("quality_review")) {
       clearStepTags(item, "quality_review");
     }
-    item.currentStep = "quality_review";
+    const workflow = loadWorkflowFile(resolveWorkflowPath(state));
+    item.currentStep = firstUnpassedReviewStep(item, workflow);
+    if (item.currentStep === null) {
+      const unfinishedTasks = item.children.filter((child) => child.type === "task" && !isTerminalPhase(child.phase));
+      if (unfinishedTasks.length === 0) {
+        item.phase = "done";
+      } else {
+        item.currentStep = "quality_review";
+      }
+    }
     syncTaskChildren(item, parsedTasks, { defaultStatus: "done" });
     return;
   }
@@ -28798,17 +28821,75 @@ async function bindReviewWorktreeRefs(item, worktreePath, branch, state) {
   }
   delete item.metadata["base_ref"];
 }
-async function bindWorktreeRefs(item, worktreePath, branch, baseBranch, opts = {}) {
+async function bindWorktreeRefs(item, worktreePath, branch) {
   item.metadata["worktree_path"] = worktreePath;
   item.metadata["branch_name"] = branch;
-  const baseRef = await getMergeBase(worktreePath, baseBranch);
-  if (!baseRef) {
-    if (opts.requireBaseRef) {
-      throw new Error(`worktree 创建成功但无法获取与 ${baseBranch} 的 merge-base：${worktreePath}`);
-    }
-    return;
+  const existing = item.metadata["scope_start_oid"];
+  if (typeof existing !== "string" || !await isAncestor(worktreePath, existing, branch)) {
+    const head = (await runGit(worktreePath, ["rev-parse", branch])).trim();
+    if (!head)
+      throw new Error(`worktree 绑定成功但无法获取 ${branch} 的 HEAD：${worktreePath}`);
+    item.metadata["scope_start_oid"] = head;
   }
-  item.metadata["base_ref"] = baseRef;
+  item.metadata["base_ref"] = item.metadata["scope_start_oid"];
+}
+function deriveChangeBranch(changeId) {
+  return `change/${normalizeSessionToken(changeId)}`;
+}
+async function ensureChangeBranch(repoRoot, branch, baseBranch) {
+  if (await isLocalBranch(repoRoot, branch))
+    return false;
+  const created = await runGitChecked(repoRoot, ["branch", branch, baseBranch]);
+  if (!created.success)
+    throw new Error(`创建分支 "${branch}"（fork 自 ${baseBranch}）失败：${created.stderr}`);
+  return true;
+}
+async function ensureChangeWorktree(repoRoot, state, item, branch, defaultPath) {
+  await ensureChangeBranch(repoRoot, branch, state.baseBranch);
+  const wtList = await runGit(repoRoot, ["worktree", "list"]);
+  const existingLine = wtList.split(`
+`).find((l) => {
+    const m = l.match(/^(\S+)\s+[0-9a-f]+\s+\[(.+?)\]/);
+    return m && m[2].trim() === branch;
+  });
+  const registeredPath = existingLine ? existingLine.match(/^(\S+)/)?.[1] : undefined;
+  const targetPath = registeredPath ?? defaultPath;
+  if (!await pathExists(targetPath)) {
+    await runGitChecked(repoRoot, ["worktree", "prune"]);
+    await runGit(repoRoot, ["worktree", "add", targetPath, branch]);
+    await bindWorktreeRefs(item, targetPath, branch);
+    return { path: targetPath, reused: false };
+  }
+  if (!registeredPath) {
+    const addRes = await runGitChecked(repoRoot, ["worktree", "add", targetPath, branch]);
+    if (!addRes.success) {
+      throw new Error(`无法在 "${targetPath}" 就位 worktree：目录已存在且不是检出分支 "${branch}" 的 git worktree（git: ${addRes.stderr}）。
+` + `请人工确认该目录内容并处理（删除或迁移）后重试。`);
+    }
+    await bindWorktreeRefs(item, targetPath, branch);
+    return { path: targetPath, reused: false };
+  }
+  const statusOut = await runGit(targetPath, ["status", "--porcelain"]);
+  const dirtyPaths = statusOut.split(`
+`).map((l) => l.trim()).filter(Boolean).map((l) => {
+    const f = l.replace(/^\S+\s+/, "");
+    return (f.includes(" -> ") ? f.split(" -> ").pop() : f).replace(/^"+|"+$/g, "");
+  }).filter(Boolean);
+  const codeDirty = dirtyPaths.filter((p) => !p.startsWith("openspec/"));
+  if (codeDirty.length > 0) {
+    throw new Error(`已有 worktree "${targetPath}" 存在未提交的代码文件变更（${codeDirty.join("、")}），无法自动处理。
+` + `请先在该 worktree 内 commit 或 stash 后重试。`);
+  }
+  if (dirtyPaths.length > 0) {
+    const addResult = await runGitChecked(targetPath, ["add", "--", ...dirtyPaths]);
+    if (!addResult.success)
+      throw new Error(`worktree openspec 目录 git add 失败：${addResult.stderr}`);
+    const commitResult = await runGitChecked(targetPath, ["commit", "-m", "docs(openspec): auto-commit before worktree reuse"]);
+    if (!commitResult.success)
+      throw new Error(`worktree openspec 目录 git commit 失败：${commitResult.stderr}`);
+  }
+  await bindWorktreeRefs(item, targetPath, branch);
+  return { path: targetPath, reused: true };
 }
 async function setWorktreeExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_set_worktree");
@@ -28819,6 +28900,7 @@ async function setWorktreeExecute(params, ctx) {
   if (!item)
     throw new Error(`工作项 "task:${state.taskGroupId}" 缺失，请重新调用 opx_orch_init。`);
   const repoRoot = ctx.worktree;
+  const isReview = state.kind === "review";
   const rawBranch = params.branch_name ?? "";
   if (rawBranch !== "") {
     const check = await runGitChecked(repoRoot, ["check-ref-format", "--branch", rawBranch]);
@@ -28826,13 +28908,18 @@ async function setWorktreeExecute(params, ctx) {
       throw new Error(`分支名 "${rawBranch}" 不合法，请修正后重试。`);
     }
   }
-  const isReview = state.kind === "review";
-  const branch = rawBranch || (isReview ? `review/${state.changeId}` : `task-group/${state.changeId}/${state.taskGroupId}`);
+  const branch = rawBranch || (isReview ? `review/${state.changeId}` : deriveChangeBranch(state.changeId));
+  if (!isReview) {
+    const check = await runGitChecked(repoRoot, ["check-ref-format", "--branch", branch]);
+    if (!check.success) {
+      throw new Error(`派生分支名 "${branch}" 不合法（change_id="${state.changeId}"），请修正 change_id 或显式传入 branch_name。`);
+    }
+  }
   let wtPath;
   if (params.worktree_path) {
     wtPath = assertPathWithin(repoRoot, params.worktree_path, "worktree_path");
   } else {
-    wtPath = isReview ? path6.join(repoRoot, ".worktree", state.changeId, "review") : path6.join(repoRoot, ".worktree", state.changeId, `task-group-${state.taskGroupId}`);
+    wtPath = isReview ? path6.join(repoRoot, ".worktree", state.changeId, "review") : path6.join(repoRoot, ".worktree", state.changeId, "ws");
   }
   const changeStatus = await runGit(repoRoot, ["status", "--porcelain", `openspec/changes/${state.changeId}/`]);
   if (changeStatus.trim().length > 0) {
@@ -28843,61 +28930,57 @@ async function setWorktreeExecute(params, ctx) {
     if (!commitResult.success)
       throw new Error(`change 目录 git commit 失败：${commitResult.stderr}`);
   }
-  const wtList = await runGit(repoRoot, ["worktree", "list"]);
-  const existingLine = wtList.split(`
-`).find((l) => {
-    const m = l.match(/^(\S+)\s+[0-9a-f]+\s+\[(.+?)\]/);
-    return m && m[2].trim() === branch;
-  });
-  const existingPath = existingLine ? existingLine.match(/^(\S+)/)?.[1] : undefined;
   let reused = false;
-  if (existingPath) {
-    const baseHead = await runGit(repoRoot, ["rev-parse", state.baseBranch]);
-    const mergeResult = await runGitChecked(existingPath, ["merge", "--ff-only", baseHead]);
-    if (mergeResult.success) {
-      if (isReview)
+  if (isReview) {
+    const wtList = await runGit(repoRoot, ["worktree", "list"]);
+    const existingLine = wtList.split(`
+`).find((l) => {
+      const m = l.match(/^(\S+)\s+[0-9a-f]+\s+\[(.+?)\]/);
+      return m && m[2].trim() === branch;
+    });
+    const existingPath = existingLine ? existingLine.match(/^(\S+)/)?.[1] : undefined;
+    if (existingPath) {
+      const baseHead = await runGit(repoRoot, ["rev-parse", state.baseBranch]);
+      const mergeResult = await runGitChecked(existingPath, ["merge", "--ff-only", baseHead]);
+      if (mergeResult.success) {
         await bindReviewWorktreeRefs(item, existingPath, branch, state);
-      else
-        await bindWorktreeRefs(item, existingPath, branch, state.baseBranch);
-      reused = true;
-    } else {
-      const clean = await isWorktreeClean(existingPath);
-      if (!clean) {
-        throw new Error(`已有 worktree "${existingPath}" 与 ${state.baseBranch} 分叉且有未提交变更，无法自动 fast-forward。
-` + `请手动处理后重试。`);
-      }
-      const localCommitCount = parseInt(await runGit(existingPath, ["rev-list", "--count", `${state.baseBranch}..HEAD`]), 10);
-      if (localCommitCount > 0 || Number.isNaN(localCommitCount)) {
-        if (isReview)
-          await bindReviewWorktreeRefs(item, existingPath, branch, state);
-        else
-          await bindWorktreeRefs(item, existingPath, branch, state.baseBranch);
         reused = true;
       } else {
-        const cleanup = await removeTaskGroupWorktree(repoRoot, existingPath, { branchName: branch });
-        if (!cleanup.dirResolved || cleanup.branchDeleted === false) {
-          const problems = [];
-          if (!cleanup.dirResolved)
-            problems.push(`无法清理已有 worktree "${existingPath}"`);
-          if (cleanup.branchDeleted === false)
-            problems.push(`无法清理已有分支 "${branch}"`);
-          throw new Error(`${problems.join("；")}：${cleanup.errors.join("；") || "原因未知"}
+        const clean = await isWorktreeClean(existingPath);
+        if (!clean) {
+          throw new Error(`已有 worktree "${existingPath}" 与 ${state.baseBranch} 分叉且有未提交变更，无法自动 fast-forward。
+` + `请手动处理后重试。`);
+        }
+        const localCommitCount = parseInt(await runGit(existingPath, ["rev-list", "--count", `${state.baseBranch}..HEAD`]), 10);
+        if (localCommitCount > 0 || Number.isNaN(localCommitCount)) {
+          await bindReviewWorktreeRefs(item, existingPath, branch, state);
+          reused = true;
+        } else {
+          const cleanup = await removeTaskGroupWorktree(repoRoot, existingPath, { branchName: branch });
+          if (!cleanup.dirResolved || cleanup.branchDeleted === false) {
+            const problems = [];
+            if (!cleanup.dirResolved)
+              problems.push(`无法清理已有 worktree "${existingPath}"`);
+            if (cleanup.branchDeleted === false)
+              problems.push(`无法清理已有分支 "${branch}"`);
+            throw new Error(`${problems.join("；")}：${cleanup.errors.join("；") || "原因未知"}
 请手动处理后重试。`);
+          }
         }
       }
     }
-  }
-  if (!reused) {
-    const forkBranch = state.baseBranch;
-    await runGit(repoRoot, ["worktree", "add", "-b", branch, wtPath, forkBranch]);
-    if (isReview) {
+    if (!reused) {
+      const forkBranch = state.baseBranch;
+      await runGit(repoRoot, ["worktree", "add", "-b", branch, wtPath, forkBranch]);
       await bindReviewWorktreeRefs(item, wtPath, branch, state);
       if (state.reviewScope?.scopeType === "pr" && !item.metadata["base_ref"]) {
         throw new Error(`worktree 创建成功但无法获取 ${state.reviewScope.baseRef} 与 ${state.baseBranch} 的 merge-base：${wtPath}`);
       }
-    } else {
-      await bindWorktreeRefs(item, wtPath, branch, forkBranch, { requireBaseRef: true });
     }
+  } else {
+    const ensured = await ensureChangeWorktree(repoRoot, state, item, branch, wtPath);
+    wtPath = ensured.path;
+    reused = ensured.reused;
   }
   await writeState(ctx.worktree, state);
   const storedPath = typeof item.metadata["worktree_path"] === "string" ? item.metadata["worktree_path"] : null;
@@ -28998,8 +29081,43 @@ function renderReviewIssueSummary(item) {
   return lines.join(`
 `);
 }
+function rollbackToCleanupStep(item, workflow) {
+  if (!workflow.stepMap.has("verify_cleanup"))
+    return false;
+  delete item.metadata["_advance_block_reason"];
+  delete item.metadata["_checkpoint"];
+  resetInternalRetryCount(item);
+  clearStepTags(item, "verify_cleanup");
+  delete item.metadata["scope_end_oid"];
+  item.phase = "review";
+  item.currentStep = "verify_cleanup";
+  return true;
+}
+function renderFinalizeBlocked(reasons, handlings, opts) {
+  const lines = [
+    `- **status**: blocked`,
+    ...reasons.map((r) => `- **原因**: ${r}`),
+    `- **说明**: worktree 与变更分支 \`${opts.branchName}\` 已保留；未执行合并，无半成品状态。属多 change 并行推进的预期行为。` + (opts.rolledBack ? "本任务组状态已回退到收尾验证（verify_cleanup）。" : ""),
+    ...handlings.map((h) => `- **处理**: ${h}`),
+    "",
+    "重新查询 opx_status 获取分派指引。"
+  ];
+  if (opts.checkboxWarning)
+    lines.push(opts.checkboxWarning);
+  return lines.join(`
+`);
+}
 async function completeTaskGroupExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_complete_task_group");
+  const lockPath = await getLockPath(ctx.worktree, params.change_id);
+  await acquireLock(lockPath);
+  try {
+    return await completeTaskGroupLocked(params, ctx);
+  } finally {
+    releaseLock(lockPath);
+  }
+}
+async function completeTaskGroupLocked(params, ctx) {
   const state = await readStateByWorktree(ctx.worktree, params.change_id);
   if (!state)
     throw new Error("编排会话未初始化。请先调用 opx_orch_init。");
@@ -29018,7 +29136,8 @@ async function completeTaskGroupExecute(params, ctx) {
     if (!clean)
       throw new Error(`worktree "${worktreePath}" 存在未 commit 内容，请先 commit 再完成任务组。`);
   }
-  const isReviewNone = state.kind === "review" && state.reviewScope?.fix === "none";
+  const isReview = state.kind === "review";
+  const isReviewNone = isReview && state.reviewScope?.fix === "none";
   const openIssues = item.children.filter((c) => isBlockingSeverity(c.severity) && !isTerminalPhase(c.phase));
   if (!isReviewNone && openIssues.length > 0) {
     throw new Error(`存在 ${openIssues.length} 个 Low 及以上的未解决 issue 未处理，请先修复或申请豁免。`);
@@ -29040,6 +29159,91 @@ async function completeTaskGroupExecute(params, ctx) {
       checkboxWarning = `- **tasks.md 复选框勾选失败**: ${e instanceof Error ? e.message : String(e)}（不影响收尾）`;
     }
   }
+  if (!isReview && worktreePath && branchName) {
+    const endOid = (await runGit(worktreePath, ["rev-parse", branchName])).trim();
+    if (endOid)
+      item.metadata["scope_end_oid"] = endOid;
+  }
+  if (isReview) {
+    return finalizeReviewSession(state, item, params, ctx, { worktreePath, branchName, isReviewNone, checkboxWarning });
+  }
+  if (!isFinalTaskGroup(state, item)) {
+    item.metadata["completed_at"] = new Date().toISOString();
+    await writeState(ctx.worktree, state);
+    const doneMessage = "任务组已完成。本任务组变更保留在 change 分支上，待全部任务组完成后统一收口合并（本次不合并、不销毁 worktree）。";
+    return checkboxWarning ? `${doneMessage}
+${checkboxWarning}` : doneMessage;
+  }
+  const mergeTarget = state.baseBranch;
+  if (branchName) {
+    await ensureChangeBranch(ctx.worktree, branchName, mergeTarget);
+    if (!await isAncestor(ctx.worktree, mergeTarget, branchName)) {
+      const workflow = loadWorkflowFile(resolveWorkflowPath(state));
+      const rolledBack = rollbackToCleanupStep(item, workflow);
+      if (rolledBack)
+        await writeState(ctx.worktree, state);
+      return renderFinalizeBlocked([
+        `基准分支 \`${mergeTarget}\` 已推进（与变更分支 \`${branchName}\` 存在漂移）：基准分支最新提交未包含在变更分支历史中，直接合并会遗漏基准分支新内容。`
+      ], [
+        `在 worktree 内执行 \`git merge ${mergeTarget}\` 合入基准分支最新代码并解决冲突，完成回归验证后重新提交收尾验证（opx_agent_submit，step_id="verify_cleanup"），通过后再调用 opx_orch_complete_task_group 重新收口。`
+      ], { branchName, mergeTarget, rolledBack, checkboxWarning });
+    }
+    const mergeResult = await mergeBranchToTarget(ctx.worktree, branchName, mergeTarget);
+    if (mergeResult.blockedMessage) {
+      return [`- **status**: blocked`, mergeResult.blockedMessage].join(`
+`);
+    }
+    if (!mergeResult.success) {
+      const workflow = loadWorkflowFile(resolveWorkflowPath(state));
+      const rolledBack = rollbackToCleanupStep(item, workflow);
+      if (rolledBack)
+        await writeState(ctx.worktree, state);
+      return renderFinalizeBlocked([
+        `变更分支 \`${branchName}\` 合并到 \`${mergeTarget}\` 时发生冲突，未产生任何变更（分支引用未动，无半成品合并）。`
+      ], [
+        `在 worktree 内执行 \`git merge ${mergeTarget}\` 合入基准分支最新代码解决冲突并提交，完成回归验证后重新提交收尾验证（opx_agent_submit，step_id="verify_cleanup"），通过后再调用 opx_orch_complete_task_group 重新收口。`
+      ], { branchName, mergeTarget, rolledBack, checkboxWarning });
+    }
+  }
+  let cleanupNote = "";
+  let cleanupResidualWarning = "";
+  if (worktreePath) {
+    const cleanup = await removeTaskGroupWorktree(ctx.worktree, worktreePath, { branchName });
+    if (cleanup.dirResolved) {
+      await sweepEmptyWorktreeParents(ctx.worktree, worktreePath, params.change_id);
+      const successNotes = [];
+      if (cleanup.dirResolvedByFallback) {
+        successNotes.push("- **cleanup**: git worktree remove 未直接移除目录，已按文件系统兜底删除并 prune 管理记录。");
+      }
+      if (cleanup.errors.length > 0) {
+        successNotes.push(`- **cleanup 部分告警**: ${cleanup.errors.join("；")}`);
+      }
+      cleanupNote = successNotes.join(`
+`);
+    } else {
+      item.metadata["cleanup_residual"] = { worktree_path: worktreePath, errors: cleanup.errors };
+      cleanupResidualWarning = [
+        "",
+        "## ⚠️ worktree 清理残留（不影响收口）",
+        `- **残留路径**: \`${worktreePath}\``,
+        "- **原因**:",
+        ...cleanup.errors.map((e) => `  - ${e}`),
+        `- **处理**: 请人工执行 \`rm -rf '${worktreePath}' && git worktree prune\` 清理残留目录与 git 管理记录。`,
+        branchName ? `- **分支**: 分支 "${branchName}" 未删除。` : ""
+      ].filter(Boolean).join(`
+`);
+    }
+  }
+  item.metadata["completed_at"] = new Date().toISOString();
+  await writeState(ctx.worktree, state);
+  const notes = [cleanupNote, checkboxWarning, cleanupResidualWarning].filter(Boolean);
+  const doneMessage = branchName ? `任务组已完成并合并到 "${mergeTarget}"。` : "任务组已完成（无变更分支引用，跳过合并）。";
+  return notes.length > 0 ? `${doneMessage}
+${notes.join(`
+`)}` : doneMessage;
+}
+async function finalizeReviewSession(state, item, params, ctx, refs) {
+  const { worktreePath, branchName, isReviewNone, checkboxWarning } = refs;
   const mergeTarget = state.baseBranch;
   if (branchName && !isReviewNone) {
     const mergeResult = await mergeBranchToTarget(ctx.worktree, branchName, mergeTarget);
@@ -29089,19 +29293,13 @@ async function completeTaskGroupExecute(params, ctx) {
   item.metadata["completed_at"] = new Date().toISOString();
   await writeState(ctx.worktree, state);
   const notes = [cleanupNote, checkboxWarning, cleanupResidualWarning].filter(Boolean);
-  if (state.kind === "review") {
-    const summary = renderReviewIssueSummary(item);
-    const doneMessage = isReviewNone ? `独立审查会话已完成（只审模式，未合并，worktree 与分支已销毁）。` : `独立审查会话已完成并合并到 "${mergeTarget}"。`;
-    return notes.length > 0 ? `${doneMessage}
+  const summary = renderReviewIssueSummary(item);
+  const doneMessage = isReviewNone ? `独立审查会话已完成（只审模式，未合并，worktree 与分支已销毁）。` : `独立审查会话已完成并合并到 "${mergeTarget}"。`;
+  return notes.length > 0 ? `${doneMessage}
 ${notes.join(`
 `)}
 ${summary}` : `${doneMessage}
 ${summary}`;
-  }
-  const doneMessage = `任务组已完成并合并到 "${mergeTarget}"。`;
-  return notes.length > 0 ? `${doneMessage}
-${notes.join(`
-`)}` : doneMessage;
 }
 async function setUnattendedExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_set_unattended");
@@ -29914,13 +30112,13 @@ var orchInitSchema = {
     },
     base_branch: {
       type: "string",
-      description: "基准分支名（如 main、develop），用于计算 merge-base 和 worktree fork 源。未传则自动从当前 git 分支推导。仅 change 会话入口有效。"
+      description: "基准分支名（如 main、develop），作为 change 分支（change/{changeId}）的 fork 源与收口合并目标。未传则自动从当前 git 分支推导。仅 change 会话入口有效。"
     },
     recovery: recoverySchema,
     mode: {
       type: "string",
       enum: ["full", "simple"],
-      description: "流程模式选择（仅 change 会话入口有效，独立审查会话不使用）：full=完整流程（analyze→implement→三重审查+收尾验证）；simple=精简流程（implement→quality_review→done，缺省）。首次新建编排状态时固化；已开始的变更仅在允许窗口内可更新：切换任务组（其他任务组均已完成或从未激活）或 recovery.phase=task_analysis 重制当前组（其他任务组同样须已完成或从未激活）；其余场景传不同 mode 将报错。"
+      description: "流程模式选择（仅 change 会话入口有效，独立审查会话不使用）：full=完整流程（analyze→implement→三重审查+收尾验证）；simple=精简流程（implement→quality_review→done，verify_cleanup 仅作收口漂移/冲突回退落点，正常流转不经过，缺省）。首次新建编排状态时固化；已开始的变更仅在允许窗口内可更新：切换任务组（其他任务组均已完成或从未激活）或 recovery.phase=task_analysis 重制当前组（其他任务组同样须已完成或从未激活）；其余场景传不同 mode 将报错。"
     },
     review_scope: {
       type: "object",
@@ -29962,8 +30160,8 @@ var setWorktreeSchema = {
   type: "object",
   properties: {
     change_id: { type: "string", minLength: 1, description: "change ID" },
-    worktree_path: { type: "string", description: "git worktree 的绝对路径（可选，不传则按规范自动生成）" },
-    branch_name: { type: "string", description: "worktree 对应的分支名（可选，不传则按规范 task-group/{changeId}/{taskGroupId}）" }
+    worktree_path: { type: "string", description: "git worktree 的绝对路径（可选，不传则按规范自动生成 .worktree/{changeId}/ws）" },
+    branch_name: { type: "string", description: "worktree 对应的分支名（可选，不传则按 change 模型确定性派生：change/{changeId}，整个 change 串行复用同一分支与常驻 worktree）" }
   },
   required: ["change_id"],
   additionalProperties: false
@@ -30152,7 +30350,7 @@ var TOOL_SPECS = {
     execute: (args, ctx) => initExecute(args, ctx)
   },
   opx_orch_set_worktree: {
-    description: "确保目标组的 git worktree 就绪。若已存在则复用，否则按规范自动创建（分支 task-group/{changeId}/{taskGroupId}，路径 .worktree/{changeId}/task-group-{taskGroupId}）。只补齐资源，不改变阶段。",
+    description: "确保目标组的 git worktree 就绪。change 会话按 change 模型 create-or-reuse：分支 change/{changeId} 不存在时从基准分支 tip 创建，worktree 常驻于 .worktree/{changeId}/ws，全部任务组串行复用（复用校验：目录缺失自愈重建、openspec 文档脏自动提交、代码文件脏拒绝）。只补齐资源，不改变阶段。",
     schema: setWorktreeSchema,
     execute: (args, ctx) => setWorktreeExecute(args, ctx)
   },
@@ -30162,7 +30360,7 @@ var TOOL_SPECS = {
     execute: (args, ctx) => statusExecute({ change_id: args.change_id }, ctx)
   },
   opx_orch_complete_task_group: {
-    description: "完成任务组收尾：合并 task-group 分支到 baseBranch → 清理 worktree 与分支。须在收尾验证（verify_cleanup）通过后调用。合并冲突、主仓库本地改动文件与合并写入文件重合、或存在部分暂存文件时中止并返回 blocked（保留 worktree/分支）；主仓库无关脏文件不阻塞合并。",
+    description: "完成任务组收尾。非最后任务组仅做门禁与范围标记（不合并、不销毁）；最后一个任务组收口时把 change 分支（change/{changeId}）一次性合并回 baseBranch（基准分支漂移或文本冲突时回退到收尾验证 verify_cleanup 并返回 blocked），成功后销毁 worktree 并删分支。须在收尾验证（verify_cleanup）通过后调用。主仓库本地改动文件与合并写入文件重合、或存在部分暂存文件时中止并返回 blocked（保留 worktree/分支）；主仓库无关脏文件不阻塞合并。",
     schema: completeTaskGroupSchema,
     execute: (args, ctx) => completeTaskGroupExecute(args, ctx)
   },
@@ -30207,7 +30405,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.136.0";
+var PKG_VERSION = "0.137.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
