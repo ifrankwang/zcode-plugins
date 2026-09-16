@@ -21671,6 +21671,12 @@ async function isAncestor(worktree, a, b) {
     return false;
   throw new Error(`无法判断 "${a}" 是否为 "${b}" 的祖先：${r.stderr}`);
 }
+async function listBranchDriftFiles(worktree, sourceBranch, targetBranch) {
+  const r = await runGitChecked(worktree, ["diff", "--name-only", "--no-renames", `${sourceBranch}...${targetBranch}`]);
+  if (!r.success)
+    return null;
+  return parseDiffNameOnly(r.stdout);
+}
 async function isLocalBranch(worktree, branch) {
   const r = await runGitChecked(worktree, ["rev-parse", "--verify", `refs/heads/${branch}`]);
   return r.success;
@@ -29081,6 +29087,12 @@ function renderReviewIssueSummary(item) {
   return lines.join(`
 `);
 }
+var DOCUMENTATION_EXTENSIONS = [".md", ".mdx", ".markdown", ".rst", ".adoc"];
+function isDocumentationOnly(files) {
+  if (files === null)
+    return false;
+  return files.every((f) => DOCUMENTATION_EXTENSIONS.some((ext) => f.endsWith(ext)));
+}
 function rollbackToCleanupStep(item, workflow) {
   if (!workflow.stepMap.has("verify_cleanup"))
     return false;
@@ -29175,18 +29187,25 @@ async function completeTaskGroupLocked(params, ctx) {
 ${checkboxWarning}` : doneMessage;
   }
   const mergeTarget = state.baseBranch;
+  let docDriftNote = "";
   if (branchName) {
     await ensureChangeBranch(ctx.worktree, branchName, mergeTarget);
     if (!await isAncestor(ctx.worktree, mergeTarget, branchName)) {
-      const workflow = loadWorkflowFile(resolveWorkflowPath(state));
-      const rolledBack = rollbackToCleanupStep(item, workflow);
-      if (rolledBack)
-        await writeState(ctx.worktree, state);
-      return renderFinalizeBlocked([
-        `基准分支 \`${mergeTarget}\` 已推进（与变更分支 \`${branchName}\` 存在漂移）：基准分支最新提交未包含在变更分支历史中，直接合并会遗漏基准分支新内容。`
-      ], [
-        `在 worktree 内执行 \`git merge ${mergeTarget}\` 合入基准分支最新代码并解决冲突，完成回归验证后重新提交收尾验证（opx_agent_submit，step_id="verify_cleanup"），通过后再调用 opx_orch_complete_task_group 重新收口。`
-      ], { branchName, mergeTarget, rolledBack, checkboxWarning });
+      const driftFiles = await listBranchDriftFiles(ctx.worktree, branchName, mergeTarget);
+      if (!isDocumentationOnly(driftFiles)) {
+        const workflow = loadWorkflowFile(resolveWorkflowPath(state));
+        const rolledBack = rollbackToCleanupStep(item, workflow);
+        if (rolledBack)
+          await writeState(ctx.worktree, state);
+        return renderFinalizeBlocked([
+          `基准分支 \`${mergeTarget}\` 已推进（与变更分支 \`${branchName}\` 存在漂移）：基准分支最新提交未包含在变更分支历史中，直接合并会遗漏基准分支新内容。`
+        ], [
+          `在 worktree 内执行 \`git merge ${mergeTarget}\` 合入基准分支最新代码并解决冲突，完成回归验证后重新提交收尾验证（opx_agent_submit，step_id="verify_cleanup"），通过后再调用 opx_orch_complete_task_group 重新收口。`
+        ], { branchName, mergeTarget, rolledBack, checkboxWarning });
+      }
+      const files = driftFiles ?? [];
+      const driftList = files.length > 10 ? `${files.slice(0, 10).join(", ")} 等 ${files.length} 个` : files.join(", ");
+      docDriftNote = `- **基准漂移（纯文档）**: 基准分支 \`${mergeTarget}\` 相对变更分支切出点净变化 ${files.length} 个文件` + (files.length > 0 ? `（${driftList}）` : "") + "，均为文档，不影响代码语义，未回退收尾验证直接合并。";
     }
     const mergeResult = await mergeBranchToTarget(ctx.worktree, branchName, mergeTarget);
     if (mergeResult.blockedMessage) {
@@ -29236,7 +29255,7 @@ ${checkboxWarning}` : doneMessage;
   }
   item.metadata["completed_at"] = new Date().toISOString();
   await writeState(ctx.worktree, state);
-  const notes = [cleanupNote, checkboxWarning, cleanupResidualWarning].filter(Boolean);
+  const notes = [docDriftNote, cleanupNote, checkboxWarning, cleanupResidualWarning].filter(Boolean);
   const doneMessage = branchName ? `任务组已完成并合并到 "${mergeTarget}"。` : "任务组已完成（无变更分支引用，跳过合并）。";
   return notes.length > 0 ? `${doneMessage}
 ${notes.join(`
@@ -30360,7 +30379,7 @@ var TOOL_SPECS = {
     execute: (args, ctx) => statusExecute({ change_id: args.change_id }, ctx)
   },
   opx_orch_complete_task_group: {
-    description: "完成任务组收尾。非最后任务组仅做门禁与范围标记（不合并、不销毁）；最后一个任务组收口时把 change 分支（change/{changeId}）一次性合并回 baseBranch（基准分支漂移或文本冲突时回退到收尾验证 verify_cleanup 并返回 blocked），成功后销毁 worktree 并删分支。须在收尾验证（verify_cleanup）通过后调用。主仓库本地改动文件与合并写入文件重合、或存在部分暂存文件时中止并返回 blocked（保留 worktree/分支）；主仓库无关脏文件不阻塞合并。",
+    description: "完成任务组收尾。非最后任务组仅做门禁与范围标记（不合并、不销毁）；最后一个任务组收口时把 change 分支（change/{changeId}）一次性合并回 baseBranch（漂移含任一非文档文件或文本冲突时回退到收尾验证 verify_cleanup 并返回 blocked，纯文档漂移直接合并收口），成功后销毁 worktree 并删分支。须在收尾验证（verify_cleanup）通过后调用。主仓库本地改动文件与合并写入文件重合、或存在部分暂存文件时中止并返回 blocked（保留 worktree/分支）；主仓库无关脏文件不阻塞合并。",
     schema: completeTaskGroupSchema,
     execute: (args, ctx) => completeTaskGroupExecute(args, ctx)
   },
@@ -30405,7 +30424,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.137.0";
+var PKG_VERSION = "0.138.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
