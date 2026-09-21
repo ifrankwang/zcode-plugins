@@ -21677,6 +21677,19 @@ async function listBranchDriftFiles(worktree, sourceBranch, targetBranch) {
     return null;
   return parseDiffNameOnly(r.stdout);
 }
+async function isVersionOnlyDrift(worktree, sourceBranch, targetBranch, filePath) {
+  const r = await runGitChecked(worktree, ["diff", "--no-renames", `${sourceBranch}...${targetBranch}`, "--", filePath]);
+  if (!r.success)
+    return null;
+  for (const line of r.stdout.split(`
+`)) {
+    if (line.startsWith("+++") || line.startsWith("---"))
+      continue;
+    if ((line.startsWith("+") || line.startsWith("-")) && !/^[+-]\s*"version"\s*:/.test(line))
+      return false;
+  }
+  return true;
+}
 async function isLocalBranch(worktree, branch) {
   const r = await runGitChecked(worktree, ["rev-parse", "--verify", `refs/heads/${branch}`]);
   return r.success;
@@ -29093,10 +29106,27 @@ function renderReviewIssueSummary(item) {
 `);
 }
 var DOCUMENTATION_EXTENSIONS = [".md", ".mdx", ".markdown", ".rst", ".adoc"];
-function isDocumentationOnly(files) {
+var DRIFT_NEUTRAL_PATH_PREFIXES = ["openspec/"];
+async function isHarmlessDrift(worktree, sourceBranch, targetBranch, files) {
   if (files === null)
     return false;
-  return files.every((f) => DOCUMENTATION_EXTENSIONS.some((ext) => f.endsWith(ext)));
+  const versionCandidates = [];
+  for (const f of files) {
+    if (DOCUMENTATION_EXTENSIONS.some((ext) => f.endsWith(ext)))
+      continue;
+    if (DRIFT_NEUTRAL_PATH_PREFIXES.some((p) => f.startsWith(p)))
+      continue;
+    if (f === "package.json" || f.endsWith("/package.json")) {
+      versionCandidates.push(f);
+      continue;
+    }
+    return false;
+  }
+  for (const f of versionCandidates) {
+    if (await isVersionOnlyDrift(worktree, sourceBranch, targetBranch, f) !== true)
+      return false;
+  }
+  return true;
 }
 function rollbackToCleanupStep(item, workflow) {
   if (!workflow.stepMap.has("verify_cleanup"))
@@ -29197,7 +29227,7 @@ ${checkboxWarning}` : doneMessage;
     await ensureChangeBranch(ctx.worktree, branchName, mergeTarget);
     if (!await isAncestor(ctx.worktree, mergeTarget, branchName)) {
       const driftFiles = await listBranchDriftFiles(ctx.worktree, branchName, mergeTarget);
-      if (!isDocumentationOnly(driftFiles)) {
+      if (!await isHarmlessDrift(ctx.worktree, branchName, mergeTarget, driftFiles)) {
         const workflow = loadWorkflowFile(resolveWorkflowPath(state));
         const rolledBack = rollbackToCleanupStep(item, workflow);
         if (rolledBack)
@@ -29210,7 +29240,7 @@ ${checkboxWarning}` : doneMessage;
       }
       const files = driftFiles ?? [];
       const driftList = files.length > 10 ? `${files.slice(0, 10).join(", ")} 等 ${files.length} 个` : files.join(", ");
-      docDriftNote = `- **基准漂移（纯文档）**: 基准分支 \`${mergeTarget}\` 相对变更分支切出点净变化 ${files.length} 个文件` + (files.length > 0 ? `（${driftList}）` : "") + "，均为文档，不影响代码语义，未回退收尾验证直接合并。";
+      docDriftNote = `- **基准漂移（无代码语义）**: 基准分支 \`${mergeTarget}\` 相对变更分支切出点净变化 ${files.length} 个文件` + (files.length > 0 ? `（${driftList}）` : "") + "，均为文档、openspec 规划路径或仅版本号变更，不影响代码语义，未回退收尾验证直接合并。";
     }
     const mergeResult = await mergeBranchToTarget(ctx.worktree, branchName, mergeTarget);
     if (mergeResult.blockedMessage) {
@@ -30384,7 +30414,7 @@ var TOOL_SPECS = {
     execute: (args, ctx) => statusExecute({ change_id: args.change_id }, ctx)
   },
   opx_orch_complete_task_group: {
-    description: "完成任务组收尾。非最后任务组仅做门禁与范围标记（不合并、不销毁）；最后一个任务组收口时把 change 分支（change/{changeId}）一次性合并回 baseBranch（漂移含任一非文档文件或文本冲突时回退到收尾验证 verify_cleanup 并返回 blocked，纯文档漂移直接合并收口），成功后销毁 worktree 并删分支。须在收尾验证（verify_cleanup）通过后调用。主仓库本地改动文件与合并写入文件重合、或存在部分暂存文件时中止并返回 blocked（保留 worktree/分支）；主仓库无关脏文件不阻塞合并。",
+    description: "完成任务组收尾。非最后任务组仅做门禁与范围标记（不合并、不销毁）；最后一个任务组收口时把 change 分支（change/{changeId}）一次性合并回 baseBranch（漂移无害——文档、openspec 规划路径或仅版本号变更的 package.json——时直接合并收口；漂移含任一其他文件或文本冲突时回退到收尾验证 verify_cleanup 并返回 blocked），成功后销毁 worktree 并删分支。须在收尾验证（verify_cleanup）通过后调用。主仓库本地改动文件与合并写入文件重合、或存在部分暂存文件时中止并返回 blocked（保留 worktree/分支）；主仓库无关脏文件不阻塞合并。",
     schema: completeTaskGroupSchema,
     execute: (args, ctx) => completeTaskGroupExecute(args, ctx)
   },
@@ -30429,7 +30459,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.140.0";
+var PKG_VERSION = "0.141.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
