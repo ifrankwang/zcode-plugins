@@ -11,9 +11,19 @@
 <!-- 关联场景：survey conclusions from clarify.md — each entry point / shared
      processing logic / downstream consumer with code evidence and its scoping
      verdict (adapted in this change, or explicitly justified out with a boundary
-     rationale confirmed by the user). Shared processing logic changes must cover
-     all consuming entry points in this change. A bare "no related impact"
+     rationale confirmed by the user). Verdicts must match the user-confirmed
+     verdicts from the clarify.md interview. Shared processing logic changes must
+     cover all consuming entry points in this change. A bare "no related impact"
      without search evidence counts as an incomplete proposal. -->
+
+## Implementation Outline
+
+<!-- 实施逻辑：how the change plays out, step by step, in plain business
+     language (人话) — where the data comes from, what validation and processing
+     it goes through, where it lands, and how each related path scoped in above
+     is adapted. Numbered steps. No code-level identifiers (class/method/function
+     names) unless the user explicitly asked for technical depth; contract facts
+     (table/column/endpoint names) are exempt and stay precise. -->
 
 ## Capabilities
 

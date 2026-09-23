@@ -108,16 +108,27 @@ artifacts:
         branches into the decisions that hang off it):
         * Problem & intent: what problem is being solved? what is the success criteria?
         * Scope: what is in/out of bounds? is the change decomposable into sub-changes?
-        * Related-surface survey (关联场景清点): enumerate every consumer of the
+        * Related-surface survey (关联场景清点): complete the survey BEFORE the
+          first interview round and treat it as input to the decision tree, not
+          just a documentation step. Enumerate every consumer of the
           capability being changed, grounded in real code — functional entry points
           (API endpoints, import/export entries, scheduled jobs, message consumers,
           frontend calls), shared processing logic reused by multiple entry points,
           and downstream data consumers (readers/writers of the tables, fields,
           events, or export artifacts involved). Record each finding with code
           evidence (file/class/method) in clarify.md's Related-Surface Survey
-          section. When shared processing logic changes, every consuming entry
-          point must be adapted within the SAME change; splitting into separate
-          changes requires an explicit boundary rationale confirmed by the user.
+          section. Every surveyed surface becomes a decision-tree branch that
+          MUST be resolved IN the interview: for each, ask the user whether it
+          is adapted in this change or excluded with a reason, and record the
+          verdict. Consistency branches are mandatory: when the same data has
+          multiple persistence paths (e.g. import, save, and update all writing
+          the same table), whether and how their validation and processing
+          logic stay shared and consistent must be asked and decided by the
+          user — touching only the requested path while skipping the related
+          paths means the interview is NOT exhausted. When shared processing
+          logic changes, every consuming entry point must be adapted within
+          the SAME change; splitting into separate changes requires an
+          explicit boundary rationale confirmed by the user.
         * Data model: which entities/tables/fields are involved? any new tables or columns?
         * Business rules: which are deterministic vs non-deterministic, per the
           project's conventions (see AGENTS.md)?
@@ -125,22 +136,50 @@ artifacts:
         * Architecture direction: propose 2-3 approaches with tradeoffs and a recommendation.
       - Round mechanics: each round asks every question whose prerequisites
         are already settled (the whole frontier at once) via the question
-        tool, numbered, each with your recommended answer; then wait for
-        the user's answers before the next round. A question whose answer
+        tool, numbered, each with your recommended answer; then wait for the
+        user's answers before the next round. A question whose answer
         depends on one still open in this round belongs to a later round.
         Facts are yours to find (codebase, specs, tools) - never ask the
         user for anything you can look up yourself; the decisions are the
         user's. Rounds continue until the frontier is empty: every branch
-        visited, no doubt left unresolved, nothing silently assumed.
+        visited, no doubt left unresolved, nothing silently assumed, and
+        every related-surface survey entry carries a user-confirmed scoping
+        verdict.
+      - Sequencing prohibition: while the interview is still open (the
+        frontier is not empty, or any related-surface survey entry lacks a
+        user-confirmed verdict), do NOT present the plan or a plan summary
+        and ask the user to confirm it. The recommended answer attached to
+        each question is not the plan and must never be presented as one;
+        do not fold plan confirmation into any interview round. If the user
+        asks for the plan mid-interview, say the interview is not finished
+        yet, you may recap what has already been settled, and keep asking
+        until the frontier is empty — only then use the plan confirmation
+        gate.
       - Challenge assumptions (yours and the user's). Reframe the problem when needed.
       - Plan confirmation gate (HARD-GATE): once the interview rounds have
-        exhausted every open doubt (frontier empty) and before starting
+        exhausted every open doubt (frontier empty — see the sequencing
+        prohibition above) and before starting
         Phase 2 (authoring — whether by you or
-        by a generation subagent), present a simple, direct plan summary to
-        the user and stop for confirmation. The summary must state: what the
-        change does in one sentence; whether it touches contracts (API
-        parameters or DDL); the chosen approach and its key trade-offs
-        versus the alternatives; the capabilities affected. Present it as a
+        by a generation subagent), present a direct plan summary to
+        the user and stop for confirmation. The summary MUST be structured:
+        number each element below and give it real substance — a
+        two-or-three-sentence blob is an invalid summary, expand it before
+        presenting. The elements:
+        1. what the change does, in one sentence;
+        2. whether it touches contracts (API parameters or DDL);
+        3. the chosen approach and its key trade-offs versus the
+           alternatives;
+        4. the implementation logic, step by step, in plain business
+           language (人话) — where the data comes from, what validation and
+           processing it goes through, where it lands, and how each related
+           path is adapted. Do NOT use code-level identifiers (class,
+           method, or internal function names) unless the user explicitly
+           asked for technical depth; contract facts (table, column, and
+           endpoint names) are exempt and stay precise;
+        5. the related-surface verdicts: for every surveyed surface,
+           adapted in this change or excluded, each with a one-line reason;
+        6. the capabilities affected.
+        Present it as a
         plain message — do NOT use the question tool for this confirmation
         (the question tool belongs to the interview rounds, not to this
         confirmation) — and stop for the user's free-text reply. Interview
@@ -157,12 +196,17 @@ artifacts:
       - **User Answers**: the user's responses, captured verbatim or summarized.
       - **Related-Surface Survey**: the related-surface survey output (关联场景清点) —
         every consuming entry point / shared processing logic / downstream
-        consumer with code evidence, and the scoping verdict for each. Shared
+        consumer with code evidence, and the scoping verdict for each —
+        every verdict confirmed by the user during the interview. Shared
         processing logic changes must be covered together with all their
         consuming entry points in the same change.
       - **Architecture Direction**: the crystallized approach, key decisions,
         alternatives considered, and the confirmed plan summary with
-        the user's explicit confirmation. This is the HARD-GATE output.
+        the user's explicit confirmation — the summary structured per the
+        six elements of the plan confirmation gate (including the
+        plain-language implementation outline and the related-surface
+        verdicts), presented as a plain message only after the interview
+        was exhausted. This is the HARD-GATE output.
       - **Initial Capabilities**: preliminary guess of which specs will be touched
         (kebab-case). Finalized in proposal.md.
 
@@ -196,11 +240,23 @@ artifacts:
       - **Related Surface (关联场景)**: the survey conclusions from clarify.md —
         every consuming entry point / shared processing logic / downstream
         consumer with code evidence and its scoping verdict (adapted in this
-        change, or explicitly justified out). When shared processing logic
+        change, or explicitly justified out). The verdicts recorded here must
+        match the user-confirmed verdicts from the clarify.md interview.
+        When shared processing logic
         changes, every consuming entry point must be adapted in THIS change;
         splitting into separate changes requires a boundary rationale section
         confirmed by the user. A bare "no related impact" without search
         evidence counts as an incomplete proposal.
+      - **Implementation Outline (实施逻辑)**: how the change plays out, step by
+        step, in plain business language (人话) — where the data comes from,
+        what validation and processing it goes through, where it lands, and
+        how each related path scoped into this change (per the Related
+        Surface section above) is adapted. What Changes lists WHAT changes;
+        this section walks through HOW it plays out, as numbered steps. Same
+        language rule as the plan summary: no code-level identifiers (class,
+        method, or internal function names) unless the user explicitly asked
+        for technical depth; contract facts (table, column, and endpoint
+        names) are exempt and stay precise.
       - **Capabilities**: Identify which specs will be created or modified:
         - **New Capabilities**: List capabilities being introduced. Each becomes a new `specs/<capability-path>/spec.md`. Use kebab-case for path segments you introduce (e.g., `user-auth` or `identity/user-auth`) and follow the project's existing spec organization.
         - **Modified Capabilities**: List existing capabilities whose REQUIREMENTS are changing. Only include if spec-level behavior changes (not just implementation details). Each needs a delta spec file. Use the exact existing path under `openspec/specs/`. Leave empty if no requirement changes.
@@ -218,8 +274,10 @@ artifacts:
       behavior, so if behavior does not change, no spec should change either.
       Do not invent a requirement just to satisfy validation.
 
-      Keep it concise (1-2 pages). Focus on the "why" not the "how" -
-      implementation details belong in design.md. Stay consistent with
+      Keep it concise (1-2 pages). The proposal covers the why and the
+      plain-language how (the Implementation Outline); code-level details
+      (class/method structure, DDL design, technology-choice argumentation)
+      belong in design.md. Stay consistent with
       clarify.md's architecture direction; if the proposal drifts from clarify,
       update clarify first and get user confirmation.
 
