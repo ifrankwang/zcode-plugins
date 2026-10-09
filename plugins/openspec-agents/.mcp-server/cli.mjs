@@ -19408,6 +19408,9 @@ class Protocol {
       this.setRequestHandler(GetTaskPayloadRequestSchema, async (request, extra) => {
         const handleTaskResult = async () => {
           const taskId = request.params.taskId;
+          if (!await this._taskStore.getTask(taskId, extra.sessionId)) {
+            throw new McpError(ErrorCode.InvalidParams, `Task not found: ${taskId}`);
+          }
           if (this._taskMessageQueue) {
             let queuedMessage;
             while (queuedMessage = await this._taskMessageQueue.dequeue(taskId, extra.sessionId)) {
@@ -19438,12 +19441,12 @@ class Protocol {
             throw new McpError(ErrorCode.InvalidParams, `Task not found: ${taskId}`);
           }
           if (!isTerminal(task.status)) {
-            await this._waitForTaskUpdate(taskId, extra.signal);
+            await this._waitForTaskUpdate(taskId, extra.signal, extra.sessionId);
             return await handleTaskResult();
           }
           if (isTerminal(task.status)) {
             const result = await this._taskStore.getTaskResult(taskId, extra.sessionId);
-            this._clearTaskQueue(taskId);
+            this._clearTaskQueue(taskId, extra.sessionId);
             return {
               ...result,
               _meta: {
@@ -19480,7 +19483,7 @@ class Protocol {
             throw new McpError(ErrorCode.InvalidParams, `Cannot cancel task in terminal status: ${task.status}`);
           }
           await this._taskStore.updateTaskStatus(request.params.taskId, "cancelled", "Client cancelled task execution.", extra.sessionId);
-          this._clearTaskQueue(request.params.taskId);
+          this._clearTaskQueue(request.params.taskId, extra.sessionId);
           const cancelledTask = await this._taskStore.getTask(request.params.taskId, extra.sessionId);
           if (!cancelledTask) {
             throw new McpError(ErrorCode.InvalidParams, `Task not found after cancellation: ${request.params.taskId}`);
@@ -19603,6 +19606,19 @@ class Protocol {
     const handler = this._requestHandlers.get(request.method) ?? this.fallbackRequestHandler;
     const capturedTransport = this._transport;
     const relatedTaskId = request.params?._meta?.[RELATED_TASK_META_KEY]?.taskId;
+    const sessionId = capturedTransport?.sessionId;
+    const store = this._taskStore;
+    let relatedTaskFound = true;
+    let relatedTaskLookup;
+    if (relatedTaskId && store && this._taskMessageQueue && sessionId !== undefined) {
+      relatedTaskFound = false;
+      relatedTaskLookup = (async () => {
+        if (!await store.getTask(relatedTaskId, sessionId)) {
+          throw new McpError(ErrorCode.InvalidParams, `Task not found: ${relatedTaskId}`);
+        }
+        relatedTaskFound = true;
+      })();
+    }
     if (handler === undefined) {
       const errorResponse = {
         jsonrpc: "2.0",
@@ -19612,7 +19628,10 @@ class Protocol {
           message: "Method not found"
         }
       };
-      if (relatedTaskId && this._taskMessageQueue) {
+      if (relatedTaskId && relatedTaskLookup) {
+        const queuedError = { type: "error", message: errorResponse, timestamp: Date.now() };
+        relatedTaskLookup.then(() => this._enqueueTaskMessage(relatedTaskId, queuedError, sessionId), () => capturedTransport?.send(errorResponse)).catch((error) => this._onerror(new Error(`Failed to send an error response: ${error}`)));
+      } else if (relatedTaskId && this._taskMessageQueue) {
         this._enqueueTaskMessage(relatedTaskId, {
           type: "error",
           message: errorResponse,
@@ -19663,7 +19682,10 @@ class Protocol {
       closeSSEStream: extra?.closeSSEStream,
       closeStandaloneSSEStream: extra?.closeStandaloneSSEStream
     };
-    Promise.resolve().then(() => {
+    (relatedTaskLookup ?? Promise.resolve()).then(() => {
+      if (relatedTaskLookup && abortController.signal.aborted) {
+        throw new McpError(ErrorCode.ConnectionClosed, "Request was cancelled");
+      }
       if (taskCreationParams) {
         this.assertTaskHandlerCapability(request.method);
       }
@@ -19698,7 +19720,7 @@ class Protocol {
           ...error["data"] !== undefined && { data: error["data"] }
         }
       };
-      if (relatedTaskId && this._taskMessageQueue) {
+      if (relatedTaskId && this._taskMessageQueue && relatedTaskFound) {
         await this._enqueueTaskMessage(relatedTaskId, {
           type: "error",
           message: errorResponse,
@@ -20086,7 +20108,7 @@ class Protocol {
       throw new Error("Cannot enqueue task message: taskStore and taskMessageQueue are not configured");
     }
     const maxQueueSize = this._options?.maxTaskQueueSize;
-    await this._taskMessageQueue.enqueue(taskId, message, sessionId, maxQueueSize);
+    await this._taskMessageQueue.enqueue(taskId, message, sessionId ?? this._transport?.sessionId, maxQueueSize);
   }
   async _clearTaskQueue(taskId, sessionId) {
     if (this._taskMessageQueue) {
@@ -20105,10 +20127,10 @@ class Protocol {
       }
     }
   }
-  async _waitForTaskUpdate(taskId, signal) {
+  async _waitForTaskUpdate(taskId, signal, sessionId) {
     let interval = this._options?.defaultTaskPollInterval ?? 1000;
     try {
-      const task = await this._taskStore?.getTask(taskId);
+      const task = await this._taskStore?.getTask(taskId, sessionId);
       if (task?.pollInterval) {
         interval = task.pollInterval;
       }
@@ -20775,6 +20797,43 @@ class ExperimentalMcpServerTasks {
   }
 }
 // node_modules/@modelcontextprotocol/sdk/dist/esm/server/mcp.js
+function toolInputElementCount(value, max) {
+  let count = 0;
+  const stack = [value];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (node === null || typeof node !== "object")
+      continue;
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        if (++count > max)
+          return count;
+        if (child !== null && typeof child === "object")
+          stack.push(child);
+      }
+    } else {
+      for (const key in node) {
+        if (!Object.prototype.hasOwnProperty.call(node, key))
+          continue;
+        if (++count > max)
+          return count;
+        const child = node[key];
+        if (child !== null && typeof child === "object")
+          stack.push(child);
+      }
+    }
+  }
+  return count;
+}
+function resolveMaxToolInputElements(value) {
+  if (value === undefined || value === Infinity)
+    return;
+  if (typeof value !== "number" || Number.isNaN(value) || value < 1) {
+    throw new RangeError(`maxToolInputElements must be a number of at least 1, or Infinity, got ${String(value)}`);
+  }
+  return value;
+}
+
 class McpServer {
   constructor(serverInfo, options) {
     this._registeredResources = {};
@@ -20786,6 +20845,7 @@ class McpServer {
     this._resourceHandlersInitialized = false;
     this._promptHandlersInitialized = false;
     this.server = new Server(serverInfo, options);
+    this._maxToolInputElements = resolveMaxToolInputElements(options?.maxToolInputElements);
   }
   get experimental() {
     if (!this._experimental) {
@@ -20892,12 +20952,15 @@ class McpServer {
     };
   }
   async validateToolInput(tool, args, toolName) {
+    if (this._maxToolInputElements !== undefined && toolInputElementCount(args, this._maxToolInputElements) > this._maxToolInputElements) {
+      throw new McpError(ErrorCode.InvalidParams, `Invalid arguments for tool ${toolName}: arguments contain more than the maximum of ${this._maxToolInputElements} elements`);
+    }
     if (!tool.inputSchema) {
       return;
     }
     const inputObj = normalizeObjectSchema(tool.inputSchema);
     const schemaToParse = inputObj ?? tool.inputSchema;
-    const parseResult = await safeParseAsync3(schemaToParse, args);
+    const parseResult = await safeParseAsync3(schemaToParse, args ?? {});
     if (!parseResult.success) {
       const error = "error" in parseResult ? parseResult.error : "Unknown error";
       const errorMessage = getParseErrorMessage(error);
@@ -21122,7 +21185,7 @@ class McpServer {
       }
       if (prompt.argsSchema) {
         const argsObj = normalizeObjectSchema(prompt.argsSchema);
-        const parseResult = await safeParseAsync3(argsObj, request.params.arguments);
+        const parseResult = await safeParseAsync3(argsObj, request.params.arguments ?? {});
         if (!parseResult.success) {
           const error = "error" in parseResult ? parseResult.error : "Unknown error";
           const errorMessage = getParseErrorMessage(error);
@@ -30459,7 +30522,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.143.0";
+var PKG_VERSION = "0.144.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
@@ -30486,7 +30549,7 @@ function buildMcpServer(worktree, opts = {}) {
 }
 
 // src/adapters/mcp-common/index.ts
-import { createServer as createServer2 } from "node:http";
+import { createServer as createServer3 } from "node:http";
 import { randomUUID } from "node:crypto";
 import { join as join5 } from "node:path";
 
@@ -30494,6 +30557,7 @@ import { join as join5 } from "node:path";
 var X_ALREADY_SENT = "x-hono-already-sent";
 
 // node_modules/@hono/node-server/dist/index.mjs
+import { STATUS_CODES, ServerResponse, createServer } from "node:http";
 import { Http2ServerRequest, constants } from "node:http2";
 import { Readable } from "node:stream";
 
@@ -31476,8 +31540,11 @@ var handleResponseError = (e, outgoing) => {
     console.info("The user aborted a request.");
   else {
     console.error(e);
-    if (!outgoing.headersSent)
+    if (!outgoing.headersSent) {
+      if (outgoing instanceof ServerResponse)
+        outgoing._contentLength = null;
       outgoing.writeHead(500, { "Content-Type": "text/plain" });
+    }
     outgoing.end(`Error: ${err.message}`);
     outgoing.destroy(err);
   }
@@ -31486,6 +31553,23 @@ var flushHeaders = (outgoing) => {
   if ("flushHeaders" in outgoing && outgoing.writable)
     outgoing.flushHeaders();
 };
+var trySetContentLength = (outgoing, status, length) => {
+  const http1 = outgoing;
+  if (http1._contentLength === null && http1._hasBody && http1.useChunkedEncodingByDefault && !http1._removedContLen && status >= 200 && status !== 204 && status !== 304 && !outgoing.hasHeader("content-length") && !outgoing.hasHeader("transfer-encoding") && !outgoing.hasHeader("trailer")) {
+    http1._contentLength = length;
+    return true;
+  }
+  return false;
+};
+var writeDefaultHeaders = (outgoing, status, length) => {
+  if (trySetContentLength(outgoing, status, length))
+    outgoing.writeHead(status, { "Content-Type": defaultContentType });
+  else
+    outgoing.writeHead(status, {
+      "Content-Type": defaultContentType,
+      "Content-Length": length
+    });
+};
 var responseViaCache = async (res, outgoing) => {
   let [status, body, header] = res[cacheKey2];
   if (!header) {
@@ -31493,22 +31577,13 @@ var responseViaCache = async (res, outgoing) => {
       outgoing.writeHead(status);
       outgoing.end();
     } else if (typeof body === "string") {
-      outgoing.writeHead(status, {
-        "Content-Type": defaultContentType,
-        "Content-Length": Buffer.byteLength(body)
-      });
+      writeDefaultHeaders(outgoing, status, Buffer.byteLength(body));
       outgoing.end(body);
     } else if (body instanceof Uint8Array) {
-      outgoing.writeHead(status, {
-        "Content-Type": defaultContentType,
-        "Content-Length": body.byteLength
-      });
+      writeDefaultHeaders(outgoing, status, body.byteLength);
       outgoing.end(body);
     } else if (body instanceof Blob) {
-      outgoing.writeHead(status, {
-        "Content-Type": defaultContentType,
-        "Content-Length": body.size
-      });
+      writeDefaultHeaders(outgoing, status, body.size);
       outgoing.end(new Uint8Array(await body.arrayBuffer()));
     } else {
       outgoing.writeHead(status, { "Content-Type": defaultContentType });
@@ -31519,6 +31594,8 @@ var responseViaCache = async (res, outgoing) => {
     return;
   }
   let hasContentLength = false;
+  let plainHeaders = false;
+  let canAutoLength = true;
   if (header instanceof Headers) {
     hasContentLength = header.has("content-length");
     header = buildOutgoingHttpHeaders(header, body === null ? undefined : defaultContentType);
@@ -31526,19 +31603,30 @@ var responseViaCache = async (res, outgoing) => {
     const headerObj = new Headers(header);
     hasContentLength = headerObj.has("content-length");
     header = buildOutgoingHttpHeaders(headerObj, body === null ? undefined : defaultContentType);
-  } else
-    for (const key in header)
+  } else {
+    plainHeaders = true;
+    for (const key in header) {
       if (key.length === 14 && key.toLowerCase() === "content-length") {
         hasContentLength = true;
         break;
       }
+      if (key.length === 17 && key.toLowerCase() === "transfer-encoding" || key.length === 7 && key.toLowerCase() === "trailer")
+        canAutoLength = false;
+    }
+  }
   if (!hasContentLength) {
+    let length;
     if (typeof body === "string")
-      header["Content-Length"] = Buffer.byteLength(body);
+      length = Buffer.byteLength(body);
     else if (body instanceof Uint8Array)
-      header["Content-Length"] = body.byteLength;
+      length = body.byteLength;
     else if (body instanceof Blob)
-      header["Content-Length"] = body.size;
+      length = body.size;
+    if (length !== undefined && (!plainHeaders || !canAutoLength || !trySetContentLength(outgoing, status, length))) {
+      if (plainHeaders)
+        header = { ...header };
+      header["Content-Length"] = length;
+    }
   }
   outgoing.writeHead(status, header);
   if (body == null)
@@ -32693,7 +32781,7 @@ class StreamableHTTPServerTransport {
 }
 
 // src/adapters/opencode/dashboard.ts
-import { createServer } from "node:http";
+import { createServer as createServer2 } from "node:http";
 
 // src/core/dashboard.ts
 import { readdirSync as readdirSync4, existsSync as existsSync5 } from "node:fs";
@@ -32798,7 +32886,7 @@ async function startDashboard(worktree) {
   const pageHtml = getDashboardPage();
   for (let port = BASE_PORT;port < BASE_PORT + MAX_ATTEMPTS; port++) {
     try {
-      const server = createServer(async (req, res) => {
+      const server = createServer2(async (req, res) => {
         try {
           const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
           if (url.pathname === "/api/state") {
@@ -33046,7 +33134,7 @@ async function startMcpServer(opts) {
   const port = opts.port ?? DEFAULT_PORT;
   const hostname = opts.hostname ?? "127.0.0.1";
   const transports = new Map;
-  const server = createServer2(async (req, res) => {
+  const server = createServer3(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? hostname}`);
     if (url.pathname === "/mcp") {
       const sessionId = Array.isArray(req.headers["mcp-session-id"]) ? req.headers["mcp-session-id"][0] : req.headers["mcp-session-id"];
