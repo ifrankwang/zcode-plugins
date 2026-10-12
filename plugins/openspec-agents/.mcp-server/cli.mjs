@@ -29810,18 +29810,24 @@ async function agentSubmitExecute(params, ctx) {
       throw new Error(`worktree 未就绪，当前拒绝提交。
 请编排者先调用 opx_orch_set_worktree 确保 worktree 就绪后再提交。`);
     }
-    if (params.fixed_issue_ids)
-      params.fixed_issue_ids = params.fixed_issue_ids.map(normalizeIssueId);
-    if (params.exempt_issue_ids)
-      params.exempt_issue_ids = params.exempt_issue_ids.map(normalizeIssueId);
-    if (params.exempt_adjudications) {
-      for (const adj of params.exempt_adjudications)
-        adj.issue_id = normalizeIssueId(adj.issue_id);
+    const normalized = { ...params };
+    if (normalized.fixed_issue_ids)
+      normalized.fixed_issue_ids = normalized.fixed_issue_ids.map(normalizeIssueId);
+    if (normalized.exempt_issue_ids)
+      normalized.exempt_issue_ids = normalized.exempt_issue_ids.map(normalizeIssueId);
+    if (normalized.exempt_adjudications) {
+      normalized.exempt_adjudications = normalized.exempt_adjudications.map((adj) => ({
+        ...adj,
+        issue_id: normalizeIssueId(adj.issue_id)
+      }));
     }
-    if (params.recheck_adjudications) {
-      for (const adj of params.recheck_adjudications)
-        adj.issue_id = normalizeIssueId(adj.issue_id);
+    if (normalized.recheck_adjudications) {
+      normalized.recheck_adjudications = normalized.recheck_adjudications.map((adj) => ({
+        ...adj,
+        issue_id: normalizeIssueId(adj.issue_id)
+      }));
     }
+    params = normalized;
     const knownChildIds = new Set;
     for (const c of item.children) {
       knownChildIds.add(c.id);
@@ -30569,7 +30575,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.147.1";
+var PKG_VERSION = "0.147.2";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
