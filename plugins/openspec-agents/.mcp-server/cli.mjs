@@ -7268,6 +7268,18 @@ function prefixIssues(path, issues) {
 function unwrapMessage(message) {
   return typeof message === "string" ? message : message?.message;
 }
+function sizeCaps(defChecks) {
+  const caps = [];
+  for (const ch of defChecks ?? []) {
+    const d = ch._zod.def;
+    if (!/_(length|size)$|_equals$/.test(d.check))
+      break;
+    const max = d.maximum ?? d.length ?? d.size;
+    if (max >= 0)
+      caps.push([max, ch]);
+  }
+  return caps;
+}
 function attachSchema(issues, start, inst) {
   var _a;
   for (let i = start;i < issues.length; i++) {
@@ -8270,7 +8282,7 @@ ${content.join(`
 var version = {
   major: 4,
   minor: 6,
-  patch: 5
+  patch: 6
 };
 
 // node_modules/zod/v4/core/schemas.js
@@ -8843,6 +8855,29 @@ var $ZodNever = /* @__PURE__ */ $constructor("$ZodNever", (inst, def) => {
     return payload;
   };
 });
+function capSize(inst, size) {
+  const caps = sizeCaps(inst._zod.def.checks);
+  if (!caps.length)
+    return;
+  const cap = Math.min(...caps.map((c) => c[0]));
+  const parse = inst._zod.parse;
+  inst._zod.parse = (payload, ctx) => {
+    const n = size(payload.value);
+    if (n > cap && !ctx?.skipChecks && ctx?.direction !== "backward") {
+      for (const [max, ch] of sizeCaps(inst._zod.def.checks)) {
+        if (n > max && ch._zod.def.when(payload)) {
+          const start = payload.issues.length;
+          ch._zod.check(payload);
+          payload.issues[start].continue = false;
+          attachSchema(payload.issues, start, inst);
+          return payload;
+        }
+      }
+    }
+    return parse(payload, ctx);
+  };
+}
+var arraySize = (input) => Array.isArray(input) ? input.length : -1;
 function handleArrayResult(result, final, index) {
   if (result.issues.length) {
     final.issues.push(...prefixIssues(index, result.issues));
@@ -8886,6 +8921,7 @@ var $ZodArray = /* @__PURE__ */ $constructor("$ZodArray", (inst, def) => {
     }
     return payload;
   };
+  capSize(inst, arraySize);
 });
 function handlePropertyResult(result, final, key, input, optin, optout) {
   const isPresent = key in input;
@@ -30533,7 +30569,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.146.1";
+var PKG_VERSION = "0.147.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
@@ -30560,9 +30596,9 @@ function buildMcpServer(worktree, opts = {}) {
 }
 
 // src/adapters/mcp-common/index.ts
-import { createServer as createServer3 } from "node:http";
+import { createServer as createServer2 } from "node:http";
 import { randomUUID } from "node:crypto";
-import { join as join5 } from "node:path";
+import { join as join4 } from "node:path";
 
 // node_modules/@hono/node-server/dist/constants-BLSFu_RU.mjs
 var X_ALREADY_SENT = "x-hono-already-sent";
@@ -32790,158 +32826,9 @@ class StreamableHTTPServerTransport {
     this._webStandardTransport.closeStandaloneSSEStream();
   }
 }
-
-// src/adapters/opencode/dashboard.ts
-import { createServer as createServer2 } from "node:http";
-
-// src/core/dashboard.ts
-import { readdirSync as readdirSync4, existsSync as existsSync5 } from "node:fs";
-import { readFile as readFile5 } from "node:fs/promises";
-import path7 from "path";
-function toWorkItemCard(item) {
-  const agentVerdicts = Object.entries(item.tags).map(([key, verdict]) => {
-    const sep = key.indexOf(":");
-    return {
-      stepId: sep === -1 ? key : key.slice(0, sep),
-      agentKey: sep === -1 ? key : key.slice(sep + 1),
-      verdict
-    };
-  });
-  const suspendReason = typeof item.metadata["suspend_reason"] === "string" ? item.metadata["suspend_reason"] : undefined;
-  return {
-    id: item.id,
-    type: item.type,
-    title: item.title,
-    description: item.description,
-    phase: item.phase,
-    suspended: item.suspended,
-    suspendReason,
-    currentStep: item.currentStep,
-    labels: item.labels,
-    source: item.source,
-    severity: item.severity,
-    agentVerdicts,
-    children: item.children.map((child) => ({
-      id: child.id,
-      type: child.type,
-      title: child.title,
-      phase: child.phase,
-      severity: child.severity
-    }))
-  };
-}
-function projectState(state) {
-  return {
-    active: true,
-    changeId: state.changeId,
-    currentTaskGroupId: state.taskGroupId,
-    baseBranch: state.baseBranch,
-    createdAt: state.createdAt,
-    updatedAt: state.updatedAt,
-    workItems: state.workItems,
-    workItemCards: state.workItems.map(toWorkItemCard)
-  };
-}
-async function readDashboardState(worktree, changeId) {
-  if (changeId) {
-    const state = await readStateByWorktree(worktree, changeId);
-    if (!state)
-      return null;
-    return projectState(state);
-  }
-  const stateDir = getStateDir(worktree);
-  if (!existsSync5(stateDir))
-    return null;
-  const files = readdirSync4(stateDir).filter((f) => f.endsWith(".json"));
-  const results = [];
-  for (const f of files) {
-    try {
-      const raw = await readFile5(path7.join(stateDir, f), "utf-8");
-      const state = JSON.parse(raw);
-      if (!state.changeId)
-        continue;
-      results.push(projectState(state));
-    } catch {}
-  }
-  if (results.length === 1)
-    return results[0];
-  return results.length > 0 ? results : null;
-}
-
-// src/dashboard/page.ts
-import { fileURLToPath as fileURLToPath3 } from "node:url";
-import { readFileSync as readFileSync5, existsSync as existsSync6 } from "node:fs";
-import { join as join3 } from "node:path";
-var _html = null;
-function resolveDashboardHtml() {
-  const __dirname2 = fileURLToPath3(new URL(".", import.meta.url));
-  const bundled = join3(__dirname2, "dashboard", "index.html");
-  if (existsSync6(bundled))
-    return bundled;
-  return join3(__dirname2, "../../assets/dashboard/index.html");
-}
-function getDashboardPage() {
-  if (_html)
-    return _html;
-  _html = readFileSync5(resolveDashboardHtml(), "utf-8");
-  return _html;
-}
-
-// src/adapters/opencode/dashboard.ts
-var BASE_PORT = 4519;
-var MAX_ATTEMPTS = 20;
-var servers = new Map;
-async function startDashboard(worktree) {
-  if (servers.has(worktree))
-    return;
-  const pageHtml = getDashboardPage();
-  for (let port = BASE_PORT;port < BASE_PORT + MAX_ATTEMPTS; port++) {
-    try {
-      const server = createServer2(async (req, res) => {
-        try {
-          const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
-          if (url.pathname === "/api/state") {
-            try {
-              const data = await readDashboardState(worktree);
-              res.writeHead(200, { "content-type": "application/json;charset=utf-8" });
-              res.end(JSON.stringify(data ?? { active: false }));
-            } catch (err) {
-              res.writeHead(500, { "content-type": "application/json;charset=utf-8" });
-              res.end(JSON.stringify({ active: false, error: String(err) }));
-            }
-            return;
-          }
-          res.writeHead(200, { "content-type": "text/html;charset=utf-8" });
-          res.end(pageHtml);
-        } catch (err) {
-          console.error("[dashboard]", err.message);
-          res.writeHead(500, { "content-type": "text/plain;charset=utf-8" });
-          res.end("internal error");
-        }
-      });
-      await new Promise((resolve, reject) => {
-        server.once("error", (err) => {
-          if (err.code === "EADDRINUSE") {
-            reject(err);
-          } else {
-            console.error("[dashboard]", err.message);
-            resolve();
-          }
-        });
-        server.listen(port, "127.0.0.1", () => resolve());
-      });
-      servers.set(worktree, server);
-      console.log(`[dashboard] 编排进度看板 http://127.0.0.1:${port}`);
-      return;
-    } catch {
-      continue;
-    }
-  }
-  console.error(`[dashboard] 无法启动编排进度看板：端口 ${BASE_PORT}-${BASE_PORT + MAX_ATTEMPTS - 1} 均被占用`);
-}
 // src/core/workflow/collector.ts
-import { readdirSync as readdirSync5, readFileSync as readFileSync6 } from "node:fs";
-import { join as join4 } from "node:path";
+import { readdirSync as readdirSync4, readFileSync as readFileSync5 } from "node:fs";
+import { join as join3 } from "node:path";
 var DEFAULT_POLL_INTERVAL_MS = 30000;
 var SOURCE = "openspec";
 var CHANGE_LABEL = "openspec-change";
@@ -32975,10 +32862,10 @@ class OpenSpecCollector {
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   }
   async pull() {
-    const changesDir = join4(this.openspecDir, "changes");
+    const changesDir = join3(this.openspecDir, "changes");
     let entries;
     try {
-      entries = readdirSync5(changesDir, { withFileTypes: true });
+      entries = readdirSync4(changesDir, { withFileTypes: true });
     } catch {
       return [];
     }
@@ -32987,7 +32874,7 @@ class OpenSpecCollector {
       if (!entry.isDirectory())
         continue;
       try {
-        const proposalText = readFileSync6(join4(changesDir, entry.name, "proposal.md"), "utf8");
+        const proposalText = readFileSync5(join3(changesDir, entry.name, "proposal.md"), "utf8");
         refs.push({ changeName: entry.name, proposalText });
       } catch {
         continue;
@@ -33129,8 +33016,7 @@ var DEFAULT_PORT = 4525;
 var MAX_PORT_ATTEMPTS = 20;
 function startSideEffects(worktree) {
   try {
-    startDashboard(worktree);
-    registerCollector(new OpenSpecCollector({ openspecDir: join5(worktree, "openspec") }));
+    registerCollector(new OpenSpecCollector({ openspecDir: join4(worktree, "openspec") }));
     registerCollector(new AdoCollector);
     readContextFromWorktree(worktree).then((ctx) => {
       if (ctx?.changeId && ctx?.taskGroupId) {
@@ -33145,7 +33031,7 @@ async function startMcpServer(opts) {
   const port = opts.port ?? DEFAULT_PORT;
   const hostname = opts.hostname ?? "127.0.0.1";
   const transports = new Map;
-  const server = createServer3(async (req, res) => {
+  const server = createServer2(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? hostname}`);
     if (url.pathname === "/mcp") {
       const sessionId = Array.isArray(req.headers["mcp-session-id"]) ? req.headers["mcp-session-id"][0] : req.headers["mcp-session-id"];
@@ -33207,7 +33093,7 @@ async function startMcpServer(opts) {
 }
 
 // src/adapters/mcp-common/cli.ts
-import { fileURLToPath as fileURLToPath4 } from "node:url";
+import { fileURLToPath as fileURLToPath3 } from "node:url";
 import { realpathSync } from "node:fs";
 function parseArgs(argv) {
   const args = new Map;
@@ -33243,7 +33129,7 @@ async function main(argv) {
   startMcpServer(opts);
 }
 try {
-  if (realpathSync(fileURLToPath4(import.meta.url)) === realpathSync(process.argv[1] ?? "")) {
+  if (realpathSync(fileURLToPath3(import.meta.url)) === realpathSync(process.argv[1] ?? "")) {
     main(process.argv.slice(2));
   }
 } catch {}
