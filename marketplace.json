@@ -8,8 +8,8 @@
     {
       "name": "openspec-agents",
       "source": "./plugins/openspec-agents",
-      "description": "OpenSpec change orchestration for AI coding agents: turn OpenSpec change specs into reviewed, high-quality code.",
-      "version": "0.149.0"
+      "description": "OpenSpec companion plugin for AI coding agents: a stricter proposal standard plus multi-agent implementation and review, gated to production-grade standards.",
+      "version": "0.149.1"
     }
   ]
 }
