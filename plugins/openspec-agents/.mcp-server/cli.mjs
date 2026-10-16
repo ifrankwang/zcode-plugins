@@ -27427,7 +27427,7 @@ function renderCheckpoint(rec, workflow, item) {
   const entry = rec.stepId ? workflow.stepMap.get(rec.stepId) : undefined;
   const stepCaps = Array.from(new Set((entry?.step.agents ?? []).flatMap((a) => a.capability_tags)));
   if (resolveMustDoForCaps(stepCaps).length > 0) {
-    lines.push(`质量门类 step 的 giveup 决策：未覆盖必做项须经 \`checkpoint_skip_reasons\` 逐项申报结构化降级理由（格式：\`${SKIP_REASON_FORMAT}\`），缺理由 giveup 不会被受理。`, "");
+    lines.push(`含必做清单的 step 的 giveup 决策：未覆盖必做项须经 \`checkpoint_skip_reasons\` 逐项申报结构化降级理由（格式：\`${SKIP_REASON_FORMAT}\`），缺理由 giveup 不会被受理。`, "");
   }
   return lines.join(`
 `);
@@ -29746,8 +29746,8 @@ function handleReviewParams(item, params, newChildren, stepId, opts) {
   if (params.verdict === "passed" && !opts.skipMustDoGate) {
     const uncovered = uncoveredMustDo(opts.capabilityTags, params.validation_steps);
     if (uncovered.length > 0) {
-      throw new Error(`提交的验证步骤未覆盖质量门 skill 必做清单，缺少以下必做项：${uncovered.join("、")}。
-` + `请按已加载质量门类 skill 的必做清单逐项执行并逐项申报结果（completed=true）；` + `确实无法执行的必做项须以结构化 skip_reason 申报降级理由` + `（格式：${SKIP_REASON_FORMAT}）。` + `低成本必做项必须实跑后申报；核验申报仅限 workflow 指令白名单限定的高成本必做项。`);
+      throw new Error(`提交的验证步骤未覆盖已加载 skill 的必做清单，缺少以下必做项：${uncovered.join("、")}。
+` + `请按已加载 skill 的必做清单逐项执行并逐项申报结果（completed=true）；` + `确实无法执行的必做项须以结构化 skip_reason 申报降级理由` + `（格式：${SKIP_REASON_FORMAT}）。` + `低成本必做项必须实跑后申报；核验申报仅限 workflow 指令白名单限定的高成本必做项。`);
     }
   }
   const isTaskVerifyStep = stepId === "verify_task" || stepId === "quality_review";
@@ -30030,7 +30030,7 @@ async function applyCheckpointDecision(params, item, workflow, ctx, state) {
       }
       const missing = uncovered.filter((m) => !provided.has(m));
       if (missing.length > 0) {
-        throw new Error(`giveup 无法应用：当前 step 的质量门必做清单存在未覆盖项，须逐项提供结构化降级理由。
+        throw new Error(`giveup 无法应用：当前 step 的已加载 skill 必做清单存在未覆盖项，须逐项提供结构化降级理由。
 ` + `缺少降级理由的必做项：${missing.join("、")}
 ` + `请通过 checkpoint_skip_reasons 逐项提供（giveup 未覆盖项不可跳过申报）：
 ` + `[${SKIP_REASON_FORMAT}]`);
@@ -30255,7 +30255,7 @@ var checkpointSkipReasonItem = {
   type: "object",
   description: "giveup 决策的必做项结构化降级理由",
   properties: {
-    item: { type: "string", minLength: 1, description: "对应的必做项（质量门 skill 的 must_do 清单项）" },
+    item: { type: "string", minLength: 1, description: "对应的必做项（已加载 skill 的 must_do 清单项）" },
     category: { type: "string", minLength: 1, description: "降级类别，如环境不可用 / 用户裁定豁免 / 无人值守自动降级" },
     adjudication: {
       type: "string",
@@ -30436,7 +30436,7 @@ var agentSubmitSchema = {
     },
     checkpoint_skip_reasons: {
       type: "array",
-      description: "giveup 决策配套：对当前 step 质量门必做清单未覆盖项的结构化降级理由（未覆盖项缺理由则拒绝 giveup）",
+      description: "giveup 决策配套：对当前 step 已加载 skill 必做清单未覆盖项的结构化降级理由（未覆盖项缺理由则拒绝 giveup）",
       items: checkpointSkipReasonItem
     },
     new_children: {
@@ -30575,7 +30575,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.148.0";
+var PKG_VERSION = "0.149.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
