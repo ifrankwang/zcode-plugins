@@ -8282,7 +8282,7 @@ ${content.join(`
 var version = {
   major: 4,
   minor: 6,
-  patch: 6
+  patch: 7
 };
 
 // node_modules/zod/v4/core/schemas.js
@@ -30575,7 +30575,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.147.2";
+var PKG_VERSION = "0.148.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
@@ -31567,7 +31567,7 @@ var makeCloseHandler = (req, incoming, outgoing, needsBodyCleanup) => () => {
   if (incoming.errored) {
     recordBodyBufferedBeforeDisconnect(incoming);
     req[abortRequest](incoming.errored.toString());
-  } else if (!outgoing.writableFinished) {
+  } else if (!outgoing.writableFinished || incoming instanceof Http2ServerRequest && incoming.aborted) {
     recordBodyBufferedBeforeDisconnect(incoming);
     req[abortRequest]("Client connection prematurely closed.");
   }
