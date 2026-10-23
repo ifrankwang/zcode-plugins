@@ -21856,6 +21856,31 @@ async function isWorktreeClean(worktree) {
   const out = await runGit(worktree, ["status", "--porcelain"]);
   return out.length === 0;
 }
+function isDocLikePath(p) {
+  return p.startsWith("openspec/") || /\.md$/i.test(p);
+}
+async function listDirtyNonDocFiles(worktree) {
+  const res = await runGitChecked(worktree, ["status", "--porcelain", "-uall"]);
+  if (!res.success)
+    return [];
+  const seen = new Set;
+  const files = [];
+  for (const entry of parseStatusEntries(res.stdout)) {
+    for (const p of entry.paths) {
+      if (!p)
+        continue;
+      if (p.startsWith("openspec/states/"))
+        continue;
+      if (isDocLikePath(p))
+        continue;
+      if (seen.has(p))
+        continue;
+      seen.add(p);
+      files.push(p);
+    }
+  }
+  return files;
+}
 async function markTaskGroupCheckboxesComplete(worktree, changeId, taskGroupId) {
   const tasksMdPath = path.join(worktree, "openspec", "changes", changeId, "tasks.md");
   let content;
@@ -22266,27 +22291,48 @@ async function reconcileMainPollution(mainRepo, worktreePath, opts) {
   }
 }
 async function autoCommitWorktreeChanges(wtPath, agent, stepId) {
-  const statusRes = await runGitChecked(wtPath, ["status", "--porcelain"]);
+  const statusRes = await runGitChecked(wtPath, ["status", "--porcelain", "-uall"]);
   if (!statusRes.success) {
     return { status: "failed", files: [], untrackedFiles: [], stderr: statusRes.stderr };
   }
-  const files = [];
-  const untrackedFiles = [];
-  for (const line of statusRes.stdout.split(`
-`).map((l) => l.trim()).filter(Boolean)) {
-    const path2 = parsePorcelainPaths(line)[0];
-    if (!path2 || path2.startsWith("openspec/states/"))
+  const trackedFiles = [];
+  const untrackedDocFiles = [];
+  const untrackedOtherFiles = [];
+  const seen = new Set;
+  const pushUnique = (list, path2) => {
+    if (seen.has(path2))
+      return;
+    seen.add(path2);
+    list.push(path2);
+  };
+  for (const entry of parseStatusEntries(statusRes.stdout)) {
+    const isUntracked = entry.x === "?" && entry.y === "?";
+    if (isUntracked) {
+      for (const path2 of entry.paths) {
+        if (!path2 || path2.startsWith("openspec/states/"))
+          continue;
+        pushUnique(isDocLikePath(path2) ? untrackedDocFiles : untrackedOtherFiles, path2);
+      }
       continue;
-    if (line.startsWith("??"))
-      untrackedFiles.push(path2);
-    else
-      files.push(path2);
+    }
+    const newPath = entry.paths[entry.paths.length - 1];
+    if (!newPath || newPath.startsWith("openspec/states/"))
+      continue;
+    pushUnique(trackedFiles, newPath);
   }
-  if (files.length === 0)
-    return { status: "skipped", files: [], untrackedFiles };
+  if (trackedFiles.length === 0 && untrackedDocFiles.length === 0) {
+    return { status: "skipped", files: [], untrackedFiles: untrackedOtherFiles };
+  }
+  const committedFiles = [...trackedFiles, ...untrackedDocFiles];
   const addResult = await runGitChecked(wtPath, ["add", "-u", "--", ".", ":(exclude)openspec/states"]);
   if (!addResult.success) {
-    return { status: "failed", files, untrackedFiles, stderr: addResult.stderr };
+    return { status: "failed", files: committedFiles, untrackedFiles: untrackedOtherFiles, stderr: addResult.stderr };
+  }
+  if (untrackedDocFiles.length > 0) {
+    const addDocResult = await runGitChecked(wtPath, ["add", "--", ...untrackedDocFiles]);
+    if (!addDocResult.success) {
+      return { status: "failed", files: committedFiles, untrackedFiles: untrackedOtherFiles, stderr: addDocResult.stderr };
+    }
   }
   const commitResult = await runGitChecked(wtPath, [
     "commit",
@@ -22294,9 +22340,9 @@ async function autoCommitWorktreeChanges(wtPath, agent, stepId) {
     `docs(opx): direct fixes by ${agent} (${stepId})`
   ]);
   if (!commitResult.success) {
-    return { status: "failed", files, untrackedFiles, stderr: commitResult.stderr };
+    return { status: "failed", files: committedFiles, untrackedFiles: untrackedOtherFiles, stderr: commitResult.stderr };
   }
-  return { status: "committed", files, untrackedFiles };
+  return { status: "committed", files: committedFiles, untrackedFiles: untrackedOtherFiles };
 }
 
 // src/core/state.ts
@@ -29978,6 +30024,22 @@ async function agentSubmitExecute(params, ctx) {
     }
     const newChildren = (params.new_children ?? []).map((nc) => buildIssueChild(nc, ctx.agent));
     if (stepPhase === "review") {
+      if (isReviewerFamily(ctx.agent)) {
+        const dirtyNonDoc = await listDirtyNonDocFiles(wtPath);
+        if (dirtyNonDoc.length > 0) {
+          const fileLines = dirtyNonDoc.map((f) => `  - ${f}`).join(`
+`);
+          throw new Error(`提交被拒绝：工作区存在未提交的代码类改动。
+` + `可能是反向探针改坏的实现未还原，或违反了「只报不改」直接修改了代码。
+` + `涉及文件：
+${fileLines}
+` + `请先清理后再提交：
+` + `  - 已跟踪文件的改动：git checkout -- <文件> 还原
+` + `  - 新增的临时文件：直接删除
+` + `文档类改动（openspec/ 下文件与 .md 文件）不受此限，提交时会自动 commit；
+` + `确属必要的代码修正，请自行 commit 后再提交。`);
+        }
+      }
       const stepCfg = workflow.stepMap.get(params.step_id).step;
       const agentCfg = stepCfg.agents.find((a) => a.id === ctx.agent);
       handleReviewParams(item, params, newChildren, params.step_id, {
@@ -29987,11 +30049,12 @@ async function agentSubmitExecute(params, ctx) {
     } else if (stepPhase === "todo") {
       handleAnalyzeParams(item, params);
     } else if (stepPhase === "in_progress") {
-      if (state.mode === "simple" && params.step_id === "implement") {
+      if (params.step_id === "implement" && (state.mode === "simple" || params.verdict === "passed")) {
         const clean = await isWorktreeClean(wtPath);
         if (!clean) {
-          throw new Error(`simple 模式 implement 提交被拒绝：工作区存在未提交内容。
-请先 git commit 提交全部变更后再提交 implement。`);
+          throw new Error(state.mode === "simple" ? `simple 模式 implement 提交被拒绝：工作区存在未提交内容。
+请先 git commit 提交全部变更后再提交 implement。` : `full 模式 implement 提交被拒绝：工作区存在未提交内容。
+请先 git commit 后再提交 implement。`);
         }
       }
       handleImplementParams(item, params);
@@ -30021,10 +30084,10 @@ async function agentSubmitExecute(params, ctx) {
       if (ac.status === "committed") {
         autoCommitLines.push(`- ✅ worktree 直改修正已自动提交（${ac.files.length} 个文件，commit message: \`docs(opx): direct fixes by ${ctx.agent} (${params.step_id})\`）`);
       } else if (ac.status === "failed") {
-        autoCommitLines.push(`- ⚠️ worktree 直改修正自动提交失败：${ac.stderr || "未知错误"}。请编排者安排补提交（worktree 内 git add -u 后 commit）`);
+        autoCommitLines.push(`- ⚠️ worktree 直改修正自动提交失败：${ac.stderr || "未知错误"}。请编排者安排补提交（在 worktree 内手工 add 并 commit：已跟踪改动用 git add -u，未跟踪文档用 git add -- <文件>）`);
       }
       if (ac.untrackedFiles.length > 0) {
-        autoCommitLines.push(`- ⚠️ 存在未跟踪新建文件未纳入自动提交（须纳入版本控制时由编排者/开发者处理）：${ac.untrackedFiles.join("、")}`);
+        autoCommitLines.push(`- ⚠️ 存在未跟踪的非文档类文件未纳入自动提交（文档类已自动提交；这些须由编排者/开发者自行处理）：${ac.untrackedFiles.join("、")}`);
       }
     }
     if (stepPhase === "todo" && params.step_id === "analyze" && params.verdict === "passed" && wtPath && typeof item.metadata["branch_name"] === "string") {
@@ -30629,7 +30692,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.151.0";
+var PKG_VERSION = "0.151.1";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
