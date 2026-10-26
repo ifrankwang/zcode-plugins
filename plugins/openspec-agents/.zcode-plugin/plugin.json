@@ -1,6 +1,6 @@
 {
   "name": "openspec-agents",
-  "version": "0.151.1",
+  "version": "0.151.2",
   "description": "OpenSpec companion plugin for AI coding agents: a stricter proposal standard plus multi-agent implementation and review, gated to production-grade standards.",
   "license": "MIT",
   "author": {

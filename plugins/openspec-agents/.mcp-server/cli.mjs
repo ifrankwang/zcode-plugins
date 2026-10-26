@@ -20936,6 +20936,15 @@ class McpServer {
     this._promptHandlersInitialized = false;
     this.server = new Server(serverInfo, options);
     this._maxToolInputElements = resolveMaxToolInputElements(options?.maxToolInputElements);
+    if (options?.capabilities?.tools) {
+      this.setToolRequestHandlers();
+    }
+    if (options?.capabilities?.resources) {
+      this.setResourceRequestHandlers();
+    }
+    if (options?.capabilities?.prompts) {
+      this.setPromptRequestHandlers();
+    }
   }
   get experimental() {
     if (!this._experimental) {
@@ -30029,15 +30038,18 @@ async function agentSubmitExecute(params, ctx) {
         if (dirtyNonDoc.length > 0) {
           const fileLines = dirtyNonDoc.map((f) => `  - ${f}`).join(`
 `);
-          throw new Error(`提交被拒绝：工作区存在未提交的代码类改动。
-` + `可能是反向探针改坏的实现未还原，或违反了「只报不改」直接修改了代码。
+          throw new Error(`提交被拒绝：工作区存在未提交的代码类改动，工具不允许这类改动随审查提交。
+` + `常见来源有两种：① 反向探针改坏的实现未还原；② 审查过程中临时修改的代码未清理。
+` + `这两种都必须先还原，不得以 commit 方式提交掉。
 ` + `涉及文件：
 ${fileLines}
-` + `请先清理后再提交：
+` + `请先还原或清理，再重新提交：
 ` + `  - 已跟踪文件的改动：git checkout -- <文件> 还原
 ` + `  - 新增的临时文件：直接删除
-` + `文档类改动（openspec/ 下文件与 .md 文件）不受此限，提交时会自动 commit；
-` + `确属必要的代码修正，请自行 commit 后再提交。`);
+` + `允许提交的范围只有注释修正与文档类：
+` + `  - 文档类（openspec/ 下文件与 .md 文件）：提交时自动 commit，无需手工处理。
+` + `  - 源码内的注释修正：可以先 commit，但该提交必须只含注释改动，不得夹带任何逻辑改动或探针改动。
+` + `代码类改动不在此列：不要把探针改动或临时改动 commit 掉来绕过本检查；审查者不应修改代码逻辑，发现问题请报 issue。`);
         }
       }
       const stepCfg = workflow.stepMap.get(params.step_id).step;
@@ -30692,7 +30704,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "0.151.1";
+var PKG_VERSION = "0.151.2";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {

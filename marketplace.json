@@ -9,7 +9,7 @@
       "name": "openspec-agents",
       "source": "./plugins/openspec-agents",
       "description": "OpenSpec companion plugin for AI coding agents: a stricter proposal standard plus multi-agent implementation and review, gated to production-grade standards.",
-      "version": "0.151.1"
+      "version": "0.151.2"
     }
   ]
 }
