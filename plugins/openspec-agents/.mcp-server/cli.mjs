@@ -35001,8 +35001,9 @@ var EMPTY_COMPLETION_RESULT = {
 };
 
 // src/core/tools/lifecycle.ts
-import path6 from "path";
-import { rmdir } from "node:fs/promises";
+import path5 from "path";
+import { createHash as createHash2 } from "node:crypto";
+import { copyFile, mkdir, readdir, readFile as readFile4, rmdir, rm as rm2 } from "node:fs/promises";
 
 // src/core/types.ts
 var CODE_DIMENSIONS = ["style", "architecture", "performance", "security", "maintainability"];
@@ -35197,6 +35198,25 @@ async function isLocalBranch(worktree, branch) {
 async function listLocalBranches(worktree) {
   const out = await runGit(worktree, ["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
   return out.split(`
+`).map((l) => l.trim()).filter(Boolean);
+}
+async function blobOidInRef(worktree, ref, relPath) {
+  const r = await runGitChecked(worktree, ["rev-parse", `${ref}:${relPath}`]);
+  if (!r.success)
+    throw new Error(`无法读取 ${ref}:${relPath} 的版本库对象：${r.stderr}`);
+  return r.stdout;
+}
+async function hashObjectOfFile(worktree, filePath) {
+  const r = await runGitChecked(worktree, ["hash-object", filePath]);
+  if (!r.success)
+    throw new Error(`无法计算 "${filePath}" 的内容哈希：${r.stderr}`);
+  return r.stdout;
+}
+async function listTreePaths(worktree, rev, dirPath) {
+  const r = await runGitChecked(worktree, ["ls-tree", "-r", "--name-only", rev, "--", dirPath]);
+  if (!r.success)
+    throw new Error(`无法读取 ${rev} 下 "${dirPath}" 的版本库内容：${r.stderr}`);
+  return r.stdout.split(`
 `).map((l) => l.trim()).filter(Boolean);
 }
 async function isWorktreeClean(worktree) {
@@ -36845,42 +36865,36 @@ function applyExemptionDowngrade(children, store) {
 }
 
 // src/core/tasks-md.ts
-import path4 from "path";
-import { readFile as readFile4 } from "node:fs/promises";
 function parseSpecTrace(line) {
   const m = line.match(/\[spec:([^\]]+)\]/);
   return m ? m[1].trim() : "";
 }
-async function parseTasksMdForGroup(worktree, changeId, taskGroupId) {
-  const tasksPath = path4.join(worktree, "openspec", "changes", changeId, "tasks.md");
+function parseTasksForGroupFromContent(content, taskGroupId) {
   const tasks = [];
-  try {
-    const content = await readFile4(tasksPath, "utf-8");
-    const lines = content.split(`
+  const lines = content.split(`
 `);
-    let currentGroup = null;
-    for (let i = 0;i < lines.length; i++) {
-      const line = lines[i];
-      const groupMatch = line.match(/^##\s+(\d+)\./);
-      if (groupMatch) {
-        if (currentGroup === taskGroupId)
-          break;
-        currentGroup = groupMatch[1];
-        continue;
-      }
-      if (currentGroup !== taskGroupId)
-        continue;
-      const taskMatch = line.match(/^-\s+\[[\sx]\]\s+(.+)/);
-      if (taskMatch) {
-        const body = taskMatch[1];
-        const taskNumberMatch = body.match(/^(\d+(?:\.\d+)+)\s+/);
-        const taskNumber = taskNumberMatch ? taskNumberMatch[1] : "";
-        const cleaned = (taskNumberMatch ? body.slice(taskNumberMatch[0].length) : body).replace(/\s*\[spec:[^\]]+\]\s*$/, "").trim();
-        const specTrace = parseSpecTrace(body);
-        tasks.push({ title: cleaned, specTrace, taskNumber });
-      }
+  let currentGroup = null;
+  for (let i = 0;i < lines.length; i++) {
+    const line = lines[i];
+    const groupMatch = line.match(/^##\s+(\d+)\./);
+    if (groupMatch) {
+      if (currentGroup === taskGroupId)
+        break;
+      currentGroup = groupMatch[1];
+      continue;
     }
-  } catch {}
+    if (currentGroup !== taskGroupId)
+      continue;
+    const taskMatch = line.match(/^-\s+\[[\sx]\]\s+(.+)/);
+    if (taskMatch) {
+      const body = taskMatch[1];
+      const taskNumberMatch = body.match(/^(\d+(?:\.\d+)+)\s+/);
+      const taskNumber = taskNumberMatch ? taskNumberMatch[1] : "";
+      const cleaned = (taskNumberMatch ? body.slice(taskNumberMatch[0].length) : body).replace(/\s*\[spec:[^\]]+\]\s*$/, "").trim();
+      const specTrace = parseSpecTrace(body);
+      tasks.push({ title: cleaned, specTrace, taskNumber });
+    }
+  }
   return tasks;
 }
 function extractRelevantSpecsFromTasks(tasks) {
@@ -36894,32 +36908,28 @@ function extractRelevantSpecsFromTasks(tasks) {
   }
   return Array.from(set3);
 }
-async function parseAllTaskGroupsFromMd(worktree, changeId) {
-  const tasksPath = path4.join(worktree, "openspec", "changes", changeId, "tasks.md");
+function parseTaskGroupsFromContent(content) {
   const groups = [];
-  try {
-    const content = await readFile4(tasksPath, "utf-8");
-    const lines = content.split(`
+  const lines = content.split(`
 `);
-    let currentGroup = null;
-    let currentTaskCount = 0;
-    for (const line of lines) {
-      const groupMatch = line.match(/^##\s+(\d+)\./);
-      if (groupMatch) {
-        if (currentGroup)
-          groups.push({ ...currentGroup, taskCount: currentTaskCount });
-        currentGroup = { id: groupMatch[1], name: line.replace(/^##\s+\d+\.\s*/, "").trim() };
-        currentTaskCount = 0;
-        continue;
-      }
-      if (currentGroup) {
-        if (/^-\s+\[[\sx]\]\s+/.test(line))
-          currentTaskCount++;
-      }
+  let currentGroup = null;
+  let currentTaskCount = 0;
+  for (const line of lines) {
+    const groupMatch = line.match(/^##\s+(\d+)\./);
+    if (groupMatch) {
+      if (currentGroup)
+        groups.push({ ...currentGroup, taskCount: currentTaskCount });
+      currentGroup = { id: groupMatch[1], name: line.replace(/^##\s+\d+\.\s*/, "").trim() };
+      currentTaskCount = 0;
+      continue;
     }
-    if (currentGroup)
-      groups.push({ ...currentGroup, taskCount: currentTaskCount });
-  } catch {}
+    if (currentGroup) {
+      if (/^-\s+\[[\sx]\]\s+/.test(line))
+        currentTaskCount++;
+    }
+  }
+  if (currentGroup)
+    groups.push({ ...currentGroup, taskCount: currentTaskCount });
   return groups;
 }
 
@@ -37021,17 +37031,17 @@ function taskGroupFromWorkItem(item) {
 }
 
 // src/core/paths.ts
-import path5 from "node:path";
+import path4 from "node:path";
 function isPathWithin(base, target) {
-  const rel = path5.relative(path5.resolve(base), path5.resolve(base, target));
-  return rel === "" || !rel.startsWith("..") && !path5.isAbsolute(rel);
+  const rel = path4.relative(path4.resolve(base), path4.resolve(base, target));
+  return rel === "" || !rel.startsWith("..") && !path4.isAbsolute(rel);
 }
 function assertPathWithin(base, target, subject) {
   if (!isPathWithin(base, target)) {
-    throw new Error(`${subject}路径 "${target}" 超出允许目录（\`${path5.resolve(base)}\`），已拒绝。
+    throw new Error(`${subject}路径 "${target}" 超出允许目录（\`${path4.resolve(base)}\`），已拒绝。
 ` + `路径必须位于该目录之内，禁止用 ".." 或绝对路径逃逸到主仓库/主分支。`);
   }
-  return path5.resolve(base, target);
+  return path4.resolve(base, target);
 }
 function assertIssueFilesWithin(issues, base) {
   if (!base)
@@ -40444,49 +40454,49 @@ function assertMustDoCatalogReferenced(catalog, workflows) {
 function fail(message) {
   throw new Error(message);
 }
-function expectString(value, path6) {
+function expectString(value, path5) {
   if (typeof value !== "string" || value.trim() === "") {
-    fail(`workflow 配置非法：${path6} 必须是非空字符串，收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path5} 必须是非空字符串，收到 ${JSON.stringify(value)}`);
   }
   return value;
 }
-function expectPositiveInt(value, path6) {
+function expectPositiveInt(value, path5) {
   if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-    fail(`workflow 配置非法：${path6} 必须是正整数，收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path5} 必须是正整数，收到 ${JSON.stringify(value)}`);
   }
   return value;
 }
-function expectStringArray(value, path6) {
+function expectStringArray(value, path5) {
   if (!Array.isArray(value) || value.length === 0 || value.some((v) => typeof v !== "string")) {
-    fail(`workflow 配置非法：${path6} 必须是非空字符串数组，收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path5} 必须是非空字符串数组，收到 ${JSON.stringify(value)}`);
   }
   return value;
 }
-function expectAgentList(value, path6) {
+function expectAgentList(value, path5) {
   if (!Array.isArray(value) || value.length === 0) {
-    fail(`workflow 配置非法：${path6} 必须是非空对象数组（每个元素含 id 与 capability_tags），收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path5} 必须是非空对象数组（每个元素含 id 与 capability_tags），收到 ${JSON.stringify(value)}`);
   }
   return value.map((v, i) => {
     if (typeof v !== "object" || v === null || Array.isArray(v)) {
-      fail(`workflow 配置非法：${path6}[${i}] 必须是对象（含 id 与 capability_tags），收到 ${JSON.stringify(v)}`);
+      fail(`workflow 配置非法：${path5}[${i}] 必须是对象（含 id 与 capability_tags），收到 ${JSON.stringify(v)}`);
     }
     const a = v;
     return {
-      id: expectString(a.id, `${path6}[${i}].id`),
-      capability_tags: expectStringArray(a.capability_tags, `${path6}[${i}].capability_tags`)
+      id: expectString(a.id, `${path5}[${i}].id`),
+      capability_tags: expectStringArray(a.capability_tags, `${path5}[${i}].capability_tags`)
     };
   });
 }
-function expectOptionalPositiveInt(value, path6) {
+function expectOptionalPositiveInt(value, path5) {
   if (value === undefined)
     return;
-  return expectPositiveInt(value, path6);
+  return expectPositiveInt(value, path5);
 }
-function expectOptionalNonEmptyStringArray(value, path6) {
+function expectOptionalNonEmptyStringArray(value, path5) {
   if (value === undefined)
     return;
   if (!Array.isArray(value) || value.length === 0 || value.some((v) => typeof v !== "string" || v.trim() === "")) {
-    fail(`workflow 配置非法：${path6} 必须是非空字符串数组，收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path5} 必须是非空字符串数组，收到 ${JSON.stringify(value)}`);
   }
   return value;
 }
@@ -40806,6 +40816,9 @@ function renderStateMismatchDiagnostic(phase, currentStep, expectedPhase) {
 function renderWorktreeSection(state, tg, opts) {
   const lines = [];
   lines.push("## Worktree", "");
+  if (state.kind !== "review") {
+    lines.push(`- **基准分支**: \`${state.baseBranch}\``);
+  }
   if (tg.worktreePath) {
     lines.push(`- **路径**: \`${tg.worktreePath}\``);
     lines.push(`- **分支**: \`${tg.branchName || "(none)"}\``);
@@ -42437,6 +42450,31 @@ function assertProjectStacks(args) {
     }
   }
 }
+async function resolveTasksContent(repoRoot, state, changeId, baseBranch) {
+  const rel = `openspec/changes/${changeId}/tasks.md`;
+  if (state) {
+    const item = state.workItems.find((w) => w.id === `task:${state.taskGroupId}`);
+    const worktreePath = item && typeof item.metadata["worktree_path"] === "string" ? item.metadata["worktree_path"] : null;
+    if (worktreePath) {
+      const p = path5.join(worktreePath, rel);
+      if (await pathExists(p)) {
+        try {
+          return await readFile4(p, "utf-8");
+        } catch {}
+      }
+    }
+  }
+  const mainPath = path5.join(repoRoot, rel);
+  if (await pathExists(mainPath)) {
+    try {
+      return await readFile4(mainPath, "utf-8");
+    } catch {}
+  }
+  const shown = await runGitChecked(repoRoot, ["show", `${baseBranch}:${rel}`]);
+  if (shown.success && shown.stdout.length > 0)
+    return shown.stdout;
+  return null;
+}
 async function initExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_init");
   const args = { ...params };
@@ -42470,9 +42508,30 @@ async function initExecute(params, ctx) {
   if (args.mode !== undefined && args.mode !== "full" && args.mode !== "simple") {
     throw new Error(`mode 参数不合法，合法值：full、simple。传入值："${String(args.mode)}"。`);
   }
-  const parsedGroups = await parseAllTaskGroupsFromMd(ctx.worktree, changeId);
+  if (args.base_branch) {
+    if (!args.base_branch.trim() || /\s/.test(args.base_branch)) {
+      throw new Error(`base_branch 不合法："${args.base_branch}"。基准分支名不能为空或包含空白字符。`);
+    }
+    if (!await isLocalBranch(ctx.worktree, args.base_branch)) {
+      const branches = await listLocalBranches(ctx.worktree);
+      throw new Error(`base_branch "${args.base_branch}" 不是本地分支。当前本地分支：${branches.join("、") || "(无)"}。
+` + `请传入已存在的本地分支名（远端分支请先在本地建分支跟踪后再传入）。`);
+    }
+  }
+  const baseBranch = args.base_branch || await getCurrentBranch(ctx.worktree);
+  let state = await readStateByChangeId(ctx.worktree, changeId);
+  if (state && args.base_branch && args.base_branch !== state.baseBranch) {
+    throw new Error(`base_branch 与已固化的基准分支不一致：已固化 "${state.baseBranch}"，本次传入 "${args.base_branch}"。
+` + `基准分支在 init 时固化、不可中途变更（change 分支的 fork 源与收口合并目标都是它）。` + `请去掉 base_branch 参数沿用固化值，或重开 change。`);
+  }
+  const wasCurrentGroup = state?.taskGroupId === args.task_group_id;
+  const stacksNote = state ? adoptOrAssertSessionStacks(state, args) : null;
+  const fallbackBaseBranch = state?.baseBranch || baseBranch;
+  const tasksContent = await resolveTasksContent(ctx.worktree, state, changeId, fallbackBaseBranch);
+  const parsedGroups = tasksContent === null ? [] : parseTaskGroupsFromContent(tasksContent);
   if (parsedGroups.length === 0) {
-    throw new Error(`无法从 tasks.md 解析出任务组，请检查文件 openspec/changes/${changeId}/tasks.md。`);
+    throw new Error(`无法从 tasks.md 解析出任务组，请检查文件 openspec/changes/${changeId}/tasks.md。
+` + `跨分支会话可重传 base_branch 或先恢复 worktree（opx_orch_set_worktree）后重试。`);
   }
   const targetGroup = parsedGroups.find((g) => g.id === args.task_group_id);
   if (!targetGroup) {
@@ -42483,17 +42542,8 @@ async function initExecute(params, ctx) {
   }
   const tasksByGroup = new Map;
   for (const g of parsedGroups) {
-    tasksByGroup.set(g.id, await parseTasksMdForGroup(ctx.worktree, changeId, g.id));
+    tasksByGroup.set(g.id, parseTasksForGroupFromContent(tasksContent, g.id));
   }
-  if (args.base_branch) {
-    if (!args.base_branch.trim() || /\s/.test(args.base_branch)) {
-      throw new Error(`base_branch 不合法："${args.base_branch}"。基准分支名不能为空或包含空白字符。`);
-    }
-  }
-  const baseBranch = args.base_branch || await getCurrentBranch(ctx.worktree);
-  let state = await readStateByChangeId(ctx.worktree, changeId);
-  const wasCurrentGroup = state?.taskGroupId === args.task_group_id;
-  const stacksNote = state ? adoptOrAssertSessionStacks(state, args) : null;
   let modeSwitchNote = null;
   if (state && args.mode !== undefined && args.mode !== (state.mode ?? "full")) {
     const othersSettled = otherTaskGroupsSettled(state, args.task_group_id);
@@ -42616,6 +42666,9 @@ async function initExecute(params, ctx) {
     parts.push(modeSwitchNote);
   if (stacksNote)
     parts.push(stacksNote);
+  parts.push(`
+
+- **基准分支**: \`${state.baseBranch}\``);
   if (args.recovery?.review_layer && (state.mode ?? "full") === "simple") {
     parts.push(`
 
@@ -42659,7 +42712,228 @@ async function ensureChangeBranch(repoRoot, branch, baseBranch) {
     throw new Error(`创建分支 "${branch}"（fork 自 ${baseBranch}）失败：${created.stderr}`);
   return true;
 }
-async function ensureChangeWorktree(repoRoot, state, item, branch, defaultPath) {
+async function listFilesRecursive(root, prefix = "") {
+  let entries = [];
+  try {
+    entries = await readdir(path5.join(root, prefix), { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const files = [];
+  for (const entry of entries) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory())
+      files.push(...await listFilesRecursive(root, rel));
+    else if (entry.isFile())
+      files.push(rel);
+  }
+  return files;
+}
+async function sha256OfFile(filePath) {
+  return createHash2("sha256").update(await readFile4(filePath)).digest("hex");
+}
+async function removeEmptyDirs(root) {
+  let entries = [];
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory())
+      await removeEmptyDirs(path5.join(root, entry.name));
+  }
+  try {
+    await rmdir(root);
+  } catch {}
+}
+function renderCrossBranchPlanCommittedBlocked(opts) {
+  const { changeId, currentBranch, baseBranch } = opts;
+  const changeDir = `openspec/changes/${changeId}`;
+  const tmpWt = `/tmp/${normalizeSessionToken(changeId)}-${normalizeSessionToken(baseBranch)}`;
+  return [
+    `- **status**: blocked`,
+    `- **原因**: 规划文档 \`${changeDir}/\` 已提交在当前检出分支 \`${currentBranch}\`，而基准分支 \`${baseBranch}\` 上没有该目录。change 工作副本从基准分支切出，会拿不到规划文档（后续解析任务组直接失败）；为避免把当前分支的规划文档搬成双份，本次未创建 worktree、未做任何改动。`,
+    `- **处理**: 把规划文档提交到基准分支后再重试，例如 \`git worktree add ${tmpWt} ${baseBranch}\` 临时检出基准分支、在临时工作树内 \`git add ${changeDir} && git commit -m "docs(openspec): add ${changeId} plan"\`、完成后 \`git worktree remove ${tmpWt}\`；或改以当前分支 \`${currentBranch}\` 为 base_branch 重开 change。`
+  ].join(`
+`);
+}
+function planDetachedOnBaseNote(baseBranch, changeDir, localFileCount) {
+  const localNote = localFileCount > 0 ? `，主仓库工作树里 ${localFileCount} 个同名副本未做处理` : "";
+  return `- **规划文档**: 基准分支 \`${baseBranch}\` 上已有 \`${changeDir}/\`，worktree 自带，未做同步（主仓库处于 detached HEAD${localNote}）。`;
+}
+function renderDetachedPlanSyncBlocked(opts) {
+  const changeDir = `openspec/changes/${opts.changeId}`;
+  return [
+    `- **status**: blocked`,
+    `- **原因**: 主仓库处于 detached HEAD，无法判定当前检出分支；基准分支 \`${opts.baseBranch}\` 上没有 \`${changeDir}/\`，而主仓库工作树里该目录有 ${opts.fileCount} 个未提交文件需要同步进变更分支，规划文档同步未执行。`,
+    `- **处理**: 请切到明确分支（如 \`git switch main\`）后重试；本次未创建新 worktree、未做任何改动。`
+  ].join(`
+`);
+}
+function renderBasePlanMismatchBlocked(opts) {
+  const changeDir = `openspec/changes/${opts.changeId}`;
+  return [
+    `- **status**: blocked`,
+    `- **原因**: 基准分支 \`${opts.baseBranch}\` 已有该 change 的规划文档且与当前工作树版本不一致，未做任何同步（避免覆盖基准分支已有内容或产生双份）。`,
+    `- **处理**: 用 \`git diff ${opts.baseBranch} -- ${changeDir}\` 核对后人工提交到基准分支，或删除重复副本后重试。`
+  ].join(`
+`);
+}
+function renderStagedPlanBlocked(opts) {
+  const changeDir = `openspec/changes/${opts.changeId}`;
+  return [
+    `- **status**: blocked`,
+    `- **原因**: 主仓库工作树里 \`${changeDir}/\` 有已暂存未提交的条目（当前检出分支 \`${opts.currentBranch}\`），直接同步并删除主仓库副本会留下幽灵暂存条目；本次未创建 worktree、未做任何改动。`,
+    `- **处理**: 先提交（\`git commit\`）或取消暂存（\`git restore --staged -- ${changeDir}\`）后重试。`
+  ].join(`
+`);
+}
+function planAlreadyOnBaseNote(baseBranch, changeDir) {
+  return `- **规划文档**: 基准分支 \`${baseBranch}\` 已有同一 change 的规划文档（\`${changeDir}/\`，与当前工作树版本一致），worktree 自带，未做同步。`;
+}
+async function isSamePlanDocsAsBase(repoRoot, baseBranch, changeDir, basePaths, localFiles) {
+  if (basePaths.length !== localFiles.length)
+    return false;
+  const baseSet = new Set(basePaths);
+  const sourceDir = path5.join(repoRoot, changeDir);
+  for (const rel of localFiles) {
+    const relPath = `${changeDir}/${rel}`;
+    if (!baseSet.has(relPath))
+      return false;
+    const baseOid = await blobOidInRef(repoRoot, baseBranch, relPath);
+    const localOid = await hashObjectOfFile(repoRoot, path5.join(sourceDir, rel));
+    if (baseOid !== localOid)
+      return false;
+  }
+  return true;
+}
+async function resolveCrossBranchPlan(repoRoot, state, currentBranch) {
+  const changeDir = `openspec/changes/${state.changeId}`;
+  const basePaths = await listTreePaths(repoRoot, state.baseBranch, changeDir);
+  const sourceDir = path5.join(repoRoot, changeDir);
+  const localFiles = await pathExists(sourceDir) ? await listFilesRecursive(sourceDir) : [];
+  if (basePaths.length > 0) {
+    if (localFiles.length === 0)
+      return { sync: false, skipNote: planAlreadyOnBaseNote(state.baseBranch, changeDir) };
+    if (await isSamePlanDocsAsBase(repoRoot, state.baseBranch, changeDir, basePaths, localFiles)) {
+      return { sync: false, skipNote: planAlreadyOnBaseNote(state.baseBranch, changeDir) };
+    }
+    return { blocked: renderBasePlanMismatchBlocked({ changeId: state.changeId, baseBranch: state.baseBranch }) };
+  }
+  if ((await listTreePaths(repoRoot, "HEAD", changeDir)).length > 0) {
+    return {
+      blocked: renderCrossBranchPlanCommittedBlocked({
+        changeId: state.changeId,
+        currentBranch,
+        baseBranch: state.baseBranch
+      })
+    };
+  }
+  const statusRes = await runGitChecked(repoRoot, ["status", "--porcelain", "-uall", "--", changeDir]);
+  if (!statusRes.success)
+    throw new Error(`无法读取主仓库工作区状态：${statusRes.stderr}`);
+  const nonUntracked = statusRes.stdout.split(`
+`).map((l) => l.trim()).filter(Boolean).filter((l) => !l.startsWith("??"));
+  if (nonUntracked.length > 0) {
+    return { blocked: renderStagedPlanBlocked({ changeId: state.changeId, currentBranch }) };
+  }
+  return { sync: true };
+}
+async function resolveDetachedPlan(repoRoot, state) {
+  const changeDir = `openspec/changes/${state.changeId}`;
+  const basePaths = await listTreePaths(repoRoot, state.baseBranch, changeDir);
+  const sourceDir = path5.join(repoRoot, changeDir);
+  const localFiles = await pathExists(sourceDir) ? await listFilesRecursive(sourceDir) : [];
+  if (basePaths.length > 0) {
+    return { sync: false, skipNote: planDetachedOnBaseNote(state.baseBranch, changeDir, localFiles.length) };
+  }
+  if (localFiles.length === 0)
+    return { sync: false };
+  return {
+    blocked: renderDetachedPlanSyncBlocked({
+      changeId: state.changeId,
+      baseBranch: state.baseBranch,
+      fileCount: localFiles.length
+    })
+  };
+}
+async function syncChangePlanDocs(repoRoot, worktreePath, state) {
+  const changeDir = `openspec/changes/${state.changeId}`;
+  const sourceDir = path5.join(repoRoot, changeDir);
+  if (!await pathExists(sourceDir))
+    return "";
+  const files = await listFilesRecursive(sourceDir);
+  if (files.length === 0)
+    return "";
+  if (!await isWorktreeClean(worktreePath)) {
+    throw new Error(`worktree "${worktreePath}" 存在未提交内容，无法同步主仓库规划文档。
+` + `请先在该 worktree 内 commit 或 stash 后重试（主仓库副本未做任何删除）。`);
+  }
+  const hashes = new Map;
+  for (const rel of files) {
+    const src = path5.join(sourceDir, rel);
+    const dst = path5.join(worktreePath, changeDir, rel);
+    hashes.set(rel, await sha256OfFile(src));
+    await mkdir(path5.dirname(dst), { recursive: true });
+    await copyFile(src, dst);
+  }
+  const addResult = await runGitChecked(worktreePath, ["add", "--", changeDir]);
+  if (!addResult.success) {
+    throw new Error(`worktree 内规划文档 git add 失败（主仓库副本未删除）：${addResult.stderr}`);
+  }
+  const staged = await runGitChecked(worktreePath, ["diff", "--cached", "--name-only", "--", changeDir]);
+  if (!staged.success) {
+    throw new Error(`无法核对 worktree 暂存内容（主仓库副本未删除）：${staged.stderr}`);
+  }
+  const stagedFiles = staged.stdout.split(`
+`).map((l) => l.trim()).filter(Boolean);
+  let commitNote = "";
+  if (stagedFiles.length > 0) {
+    const commitResult = await runGitChecked(worktreePath, ["commit", "-m", "docs(openspec): sync change plan into change branch"]);
+    if (!commitResult.success) {
+      throw new Error(`worktree 内规划文档 git commit 失败（主仓库副本未删除，规划文档已复制到 worktree 但未提交）：${commitResult.stderr}
+` + `请先在 worktree 内处理暂存区后重试。`);
+    }
+    const commitOid = (await runGit(worktreePath, ["rev-parse", "HEAD"])).trim();
+    commitNote = commitOid ? `、commit \`${commitOid}\`` : "";
+  }
+  const committed = new Set(await listTreePaths(worktreePath, "HEAD", changeDir));
+  const missing = files.filter((rel) => !committed.has(`${changeDir}/${rel}`));
+  if (missing.length > 0) {
+    throw new Error(`规划文档未全部提交到变更分支（缺少：${missing.join("、")}），已跳过删除主仓库副本。
+` + `常见原因：文件被 .gitignore 忽略。请人工核对后执行 \`git -C '${worktreePath}' add -f -- ${changeDir}\` 并提交，` + `或删除主仓库未跟踪副本：\`rm -rf '${sourceDir}'\`。`);
+  }
+  const currentFiles = await listFilesRecursive(sourceDir);
+  const snapshot = new Set(files);
+  const extra = currentFiles.filter((rel) => !snapshot.has(rel));
+  if (extra.length > 0) {
+    throw new Error(`主仓库规划文档目录出现快照外新文件（${extra.join("、")}），已中止删除，未删除任何文件。
+` + `请人工核对后删除主仓库副本：\`rm -rf '${sourceDir}'\`。`);
+  }
+  const changed = [];
+  for (const rel of files) {
+    const src = path5.join(sourceDir, rel);
+    if (!await pathExists(src) || await sha256OfFile(src) !== hashes.get(rel))
+      changed.push(rel);
+  }
+  if (changed.length > 0) {
+    throw new Error(`主仓库规划文档在同步过程中被修改，已跳过删除（worktree 已提交，内容不会丢失）：${changed.join("、")}。
+` + `请人工核对后删除主仓库未跟踪副本：\`rm -rf '${sourceDir}'\`。`);
+  }
+  for (const rel of files) {
+    try {
+      await rm2(path5.join(sourceDir, rel), { force: true });
+    } catch (e) {
+      throw new Error(`主仓库规划文档副本删除失败（${rel}）：${e instanceof Error ? e.message : String(e)}。
+` + `worktree 已提交、内容安全，请人工删除主仓库副本：\`rm -rf '${sourceDir}'\`。`);
+    }
+  }
+  await removeEmptyDirs(sourceDir);
+  return `- **规划文档**: 已从主仓库工作树同步到变更分支（${files.length} 个文件${commitNote}），主仓库工作树副本已清理。`;
+}
+async function ensureChangeWorktree(repoRoot, state, item, branch, defaultPath, plan) {
+  const applyPlan = async (worktreePath) => plan.sync ? await syncChangePlanDocs(repoRoot, worktreePath, state) : plan.skipNote;
   await ensureChangeBranch(repoRoot, branch, state.baseBranch);
   const wtList = await runGit(repoRoot, ["worktree", "list"]);
   const existingLine = wtList.split(`
@@ -42672,8 +42946,9 @@ async function ensureChangeWorktree(repoRoot, state, item, branch, defaultPath) 
   if (!await pathExists(targetPath)) {
     await runGitChecked(repoRoot, ["worktree", "prune"]);
     await runGit(repoRoot, ["worktree", "add", targetPath, branch]);
+    const planNote2 = await applyPlan(targetPath);
     await bindWorktreeRefs(item, targetPath, branch);
-    return { path: targetPath, reused: false };
+    return { path: targetPath, reused: false, planNote: planNote2 };
   }
   if (!registeredPath) {
     const addRes = await runGitChecked(repoRoot, ["worktree", "add", targetPath, branch]);
@@ -42681,8 +42956,9 @@ async function ensureChangeWorktree(repoRoot, state, item, branch, defaultPath) 
       throw new Error(`无法在 "${targetPath}" 就位 worktree：目录已存在且不是检出分支 "${branch}" 的 git worktree（git: ${addRes.stderr}）。
 ` + `请人工确认该目录内容并处理（删除或迁移）后重试。`);
     }
+    const planNote2 = await applyPlan(targetPath);
     await bindWorktreeRefs(item, targetPath, branch);
-    return { path: targetPath, reused: false };
+    return { path: targetPath, reused: false, planNote: planNote2 };
   }
   const statusOut = await runGit(targetPath, ["status", "--porcelain"]);
   const dirtyPaths = statusOut.split(`
@@ -42703,8 +42979,9 @@ async function ensureChangeWorktree(repoRoot, state, item, branch, defaultPath) 
     if (!commitResult.success)
       throw new Error(`worktree openspec 目录 git commit 失败：${commitResult.stderr}`);
   }
+  const planNote = await applyPlan(targetPath);
   await bindWorktreeRefs(item, targetPath, branch);
-  return { path: targetPath, reused: true };
+  return { path: targetPath, reused: true, planNote };
 }
 async function setWorktreeExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_set_worktree");
@@ -42734,18 +43011,38 @@ async function setWorktreeExecute(params, ctx) {
   if (params.worktree_path) {
     wtPath = assertPathWithin(repoRoot, params.worktree_path, "worktree_path");
   } else {
-    wtPath = isReview ? path6.join(repoRoot, ".worktree", state.changeId, "review") : path6.join(repoRoot, ".worktree", state.changeId, "ws");
+    wtPath = isReview ? path5.join(repoRoot, ".worktree", state.changeId, "review") : path5.join(repoRoot, ".worktree", state.changeId, "ws");
   }
-  const changeStatus = await runGit(repoRoot, ["status", "--porcelain", `openspec/changes/${state.changeId}/`]);
-  if (changeStatus.trim().length > 0) {
-    const addResult = await runGitChecked(repoRoot, ["add", `openspec/changes/${state.changeId}/`]);
-    if (!addResult.success)
-      throw new Error(`change 目录 git add 失败：${addResult.stderr}`);
-    const commitResult = await runGitChecked(repoRoot, ["commit", "-m", "docs(openspec): auto-commit before worktree setup"]);
-    if (!commitResult.success)
-      throw new Error(`change 目录 git commit 失败：${commitResult.stderr}`);
+  const currentBranch = isReview ? "" : (await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
+  const detached = !isReview && (currentBranch === "" || currentBranch === "HEAD");
+  const crossBranch = !isReview && !detached && currentBranch !== state.baseBranch;
+  let planSync = false;
+  let planSkipNote = "";
+  if (detached) {
+    const plan = await resolveDetachedPlan(repoRoot, state);
+    if (plan.blocked)
+      return plan.blocked;
+    planSkipNote = plan.skipNote ?? "";
+  } else if (crossBranch) {
+    const plan = await resolveCrossBranchPlan(repoRoot, state, currentBranch);
+    if (plan.blocked)
+      return plan.blocked;
+    planSync = plan.sync ?? false;
+    planSkipNote = plan.skipNote ?? "";
+  }
+  if (!detached && !crossBranch) {
+    const changeStatus = await runGit(repoRoot, ["status", "--porcelain", `openspec/changes/${state.changeId}/`]);
+    if (changeStatus.trim().length > 0) {
+      const addResult = await runGitChecked(repoRoot, ["add", `openspec/changes/${state.changeId}/`]);
+      if (!addResult.success)
+        throw new Error(`change 目录 git add 失败：${addResult.stderr}`);
+      const commitResult = await runGitChecked(repoRoot, ["commit", "-m", "docs(openspec): auto-commit before worktree setup"]);
+      if (!commitResult.success)
+        throw new Error(`change 目录 git commit 失败：${commitResult.stderr}`);
+    }
   }
   let reused = false;
+  let planNote = "";
   if (isReview) {
     const wtList = await runGit(repoRoot, ["worktree", "list"]);
     const existingLine = wtList.split(`
@@ -42793,9 +43090,13 @@ async function setWorktreeExecute(params, ctx) {
       }
     }
   } else {
-    const ensured = await ensureChangeWorktree(repoRoot, state, item, branch, wtPath);
+    const ensured = await ensureChangeWorktree(repoRoot, state, item, branch, wtPath, {
+      sync: planSync,
+      skipNote: planSkipNote
+    });
     wtPath = ensured.path;
     reused = ensured.reused;
+    planNote = ensured.planNote;
   }
   await writeState(ctx.worktree, state);
   const storedPath = typeof item.metadata["worktree_path"] === "string" ? item.metadata["worktree_path"] : null;
@@ -42805,7 +43106,8 @@ async function setWorktreeExecute(params, ctx) {
   return [
     `- **状态**: ${reused ? "复用已有 worktree" : "已创建 worktree"}`,
     `- **路径**: \`${item.metadata["worktree_path"]}\``,
-    `- **分支**: \`${branch}\``
+    `- **分支**: \`${branch}\``,
+    ...planNote ? ["", planNote] : []
   ].join(`
 `);
 }
@@ -42853,10 +43155,10 @@ async function statusExecute(params, ctx) {
   return renderWorkflowStatusView(item, workflow, rec, { agent, orchestrator: ctx.orchestrator, identityDeclared: ctx.identityDeclared }, { state, tg, mainPollution, toolChanges, exemptedHits, exemptionItems });
 }
 async function sweepEmptyWorktreeParents(repoRoot, removedDir, changeId) {
-  const repoRootAbs = path6.resolve(repoRoot);
-  const groupLevelDir = path6.join(repoRootAbs, ".worktree", changeId);
-  const worktreeLevelDir = path6.join(repoRootAbs, ".worktree");
-  if (path6.dirname(path6.resolve(removedDir)) === groupLevelDir) {
+  const repoRootAbs = path5.resolve(repoRoot);
+  const groupLevelDir = path5.join(repoRootAbs, ".worktree", changeId);
+  const worktreeLevelDir = path5.join(repoRootAbs, ".worktree");
+  if (path5.dirname(path5.resolve(removedDir)) === groupLevelDir) {
     try {
       await rmdir(groupLevelDir);
     } catch {}
@@ -44076,7 +44378,7 @@ var orchInitSchema = {
     },
     base_branch: {
       type: "string",
-      description: "基准分支名（如 main、develop），作为 change 分支（change/{changeId}）的 fork 源与收口合并目标。未传则自动从当前 git 分支推导。仅 change 会话入口有效。"
+      description: "基准分支名（如 main、develop），作为 change 分支（change/{changeId}）的 fork 源与收口合并目标。须为已存在的本地分支（远端引用不支持）；未传则自动从当前 git 分支推导。基准分支在 init 时固化，重入传不同值会被拒绝；主仓库检出分支不需要切换。仅 change 会话入口有效。"
     },
     recovery: recoverySchema,
     project_stacks: {
@@ -44340,7 +44642,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "1.1.1";
+var PKG_VERSION = "1.2.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
