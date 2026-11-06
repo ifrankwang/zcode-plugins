@@ -36933,130 +36933,6 @@ function parseTaskGroupsFromContent(content) {
   return groups;
 }
 
-// src/core/derive.ts
-function createEmptyQualityProgress() {
-  return {
-    style: "pending",
-    architecture: "pending",
-    performance: "pending",
-    security: "pending",
-    maintainability: "pending"
-  };
-}
-function assertOrchestrator(ctx, toolName) {
-  if (!ctx.orchestrator) {
-    throw new Error(`工具 "${toolName}" 仅限编排者（主代理）调用，当前调用者为 "${ctx.agent}"。`);
-  }
-}
-function findTaskGroup(state, id) {
-  const item = state.workItems.find((w) => w.id === `task:${id}`);
-  if (!item)
-    throw new Error(`任务组 "${id}" 不在任务清单中。`);
-  return taskGroupFromWorkItem(item);
-}
-function childPhaseToIssueStatus(phase) {
-  switch (phase) {
-    case "done":
-      return "verified";
-    case "cancelled":
-      return "exempted";
-    case "review":
-      return "submitted";
-    default:
-      return "open";
-  }
-}
-function projectIssueFromChild(child) {
-  const f = resolveChildIssueFields(child);
-  const baseStatus = childPhaseToIssueStatus(child.phase);
-  const hasExemptRequest = child.metadata[EXEMPT_REQUEST_KEY] !== undefined;
-  return {
-    id: child.externalId ?? child.id.replace(/^issue:/, ""),
-    dimension: f.dimension,
-    sourcePhase: f.sourcePhase,
-    severity: child.severity ?? "Info",
-    file: f.file,
-    line: f.line,
-    description: child.description,
-    suggestion: typeof child.metadata["suggestion"] === "string" ? child.metadata["suggestion"] : "",
-    status: hasExemptRequest ? "exemption_requested" : baseStatus,
-    refixCount: typeof child.metadata["refix_count"] === "number" ? child.metadata["refix_count"] : 0,
-    rootCauseGuess: typeof child.metadata["root_cause_guess"] === "string" ? child.metadata["root_cause_guess"] : null,
-    exemptReason: typeof child.metadata["exempt_reason"] === "string" ? child.metadata["exempt_reason"] : null,
-    rejectReason: typeof child.metadata["reject_reason"] === "string" ? child.metadata["reject_reason"] : null,
-    rule: typeof child.metadata["rule"] === "string" ? child.metadata["rule"] : undefined
-  };
-}
-function workItemPhaseToTaskGroupStatus(phase) {
-  switch (phase) {
-    case "todo":
-      return "task_analysis";
-    case "in_progress":
-      return "dev_impl";
-    case "review":
-    case "done":
-      return "review";
-    default:
-      return "completed";
-  }
-}
-function taskGroupFromWorkItem(item) {
-  const m = item.metadata;
-  const tasks = taskListOf(item);
-  return {
-    id: item.externalId ?? item.id.replace(/^task:/, ""),
-    name: typeof m["name"] === "string" ? m["name"] : item.title,
-    taskCount: typeof m["task_count"] === "number" ? m["task_count"] : tasks.length,
-    worktreePath: typeof m["worktree_path"] === "string" ? m["worktree_path"] : null,
-    branchName: typeof m["branch_name"] === "string" ? m["branch_name"] : null,
-    baseRef: typeof m["base_ref"] === "string" ? m["base_ref"] : null,
-    executionBoundary: m["execution_boundary"] ?? null,
-    relevantSpecs: Array.isArray(m["relevant_specs"]) ? m["relevant_specs"] : [],
-    status: workItemPhaseToTaskGroupStatus(item.phase),
-    phases: {
-      architect_review: { completed: false },
-      review: {
-        retryCount: 0,
-        lastResolvedRetryCount: 0,
-        tool: { completed: false },
-        task: { completed: false },
-        quality: { progress: createEmptyQualityProgress() }
-      }
-    },
-    tasks,
-    issues: issueChildrenOf(item).map(projectIssueFromChild),
-    blockers: Array.isArray(m["blockers"]) ? m["blockers"] : [],
-    agentSummaries: typeof m["agent_summaries"] === "object" ? m["agent_summaries"] : undefined
-  };
-}
-
-// src/core/paths.ts
-import path4 from "node:path";
-function isPathWithin(base, target) {
-  const rel = path4.relative(path4.resolve(base), path4.resolve(base, target));
-  return rel === "" || !rel.startsWith("..") && !path4.isAbsolute(rel);
-}
-function assertPathWithin(base, target, subject) {
-  if (!isPathWithin(base, target)) {
-    throw new Error(`${subject}路径 "${target}" 超出允许目录（\`${path4.resolve(base)}\`），已拒绝。
-` + `路径必须位于该目录之内，禁止用 ".." 或绝对路径逃逸到主仓库/主分支。`);
-  }
-  return path4.resolve(base, target);
-}
-function assertIssueFilesWithin(issues, base) {
-  if (!base)
-    return;
-  for (const iss of issues) {
-    if (iss.file)
-      assertPathWithin(base, iss.file, "issue 文件");
-  }
-}
-
-// src/core/workflow/loader.ts
-import { readFileSync as readFileSync3, existsSync as existsSync4 } from "node:fs";
-import { dirname as dirname2, resolve as pathResolve } from "node:path";
-import { fileURLToPath as fileURLToPath2 } from "node:url";
-
 // node_modules/js-yaml/dist/js-yaml.mjs
 function getDefaultExportFromCjs(x) {
   return x && x.__esModule && Object.prototype.hasOwnProperty.call(x, "default") ? x["default"] : x;
@@ -40174,6 +40050,210 @@ function requireJsYaml() {
 var jsYamlExports = requireJsYaml();
 var yaml = /* @__PURE__ */ getDefaultExportFromCjs(jsYamlExports);
 
+// src/core/clarify-md.ts
+function normalizeHeading(text) {
+  return text.trim().replace(/[:：]\s*$/, "").replace(/^\d+\s*[.、)）]\s*/, "").replace(/^[一二三四五六七八九十]+\s*[、.]\s*/, "").trim();
+}
+function findBoundarySection(lines) {
+  for (let i = 0;i < lines.length; i++) {
+    const m = lines[i].match(/^\s{0,3}(#{1,6})\s+(.*)$/);
+    if (!m)
+      continue;
+    if (!normalizeHeading(m[2]).startsWith("执行边界"))
+      continue;
+    const level = m[1].length;
+    let end = lines.length;
+    for (let j = i + 1;j < lines.length; j++) {
+      const next = lines[j].match(/^\s{0,3}(#{1,6})\s+/);
+      if (next && next[1].length <= level) {
+        end = j;
+        break;
+      }
+    }
+    return { start: i + 1, end };
+  }
+  return null;
+}
+function firstYamlFence(lines, start, end) {
+  let bodyStart = -1;
+  for (let i = start;i < end; i++) {
+    const line = lines[i];
+    if (bodyStart < 0) {
+      if (/^\s*```\s*ya?ml\s*$/i.test(line))
+        bodyStart = i + 1;
+      continue;
+    }
+    if (/^\s*```\s*$/.test(line))
+      return lines.slice(bodyStart, i).join(`
+`);
+  }
+  return null;
+}
+function isNonEmptyStringArray(v) {
+  return Array.isArray(v) && v.length > 0 && v.every((s) => typeof s === "string" && s.trim() !== "");
+}
+function parseExecutionBoundary(content, taskGroupId) {
+  if (typeof content !== "string" || content.trim() === "")
+    return null;
+  try {
+    const lines = content.split(/\r?\n/);
+    const section = findBoundarySection(lines);
+    if (!section)
+      return null;
+    const yamlText = firstYamlFence(lines, section.start, section.end);
+    if (yamlText === null)
+      return null;
+    const raw = yaml.load(yamlText);
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw))
+      return null;
+    const groups = raw["task_groups"];
+    if (typeof groups !== "object" || groups === null || Array.isArray(groups))
+      return null;
+    const entry = groups[taskGroupId];
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry))
+      return null;
+    const rec = entry;
+    const dirs = rec["allowed_directories"];
+    const pkgs = rec["allowed_packages"];
+    if (!isNonEmptyStringArray(dirs) || !isNonEmptyStringArray(pkgs))
+      return null;
+    const rawNotes = rec["notes"];
+    if (rawNotes !== undefined && typeof rawNotes !== "string")
+      return null;
+    return {
+      allowed_directories: dirs.map((s) => s.trim()),
+      allowed_packages: pkgs.map((s) => s.trim()),
+      notes: typeof rawNotes === "string" ? rawNotes : ""
+    };
+  } catch {
+    return null;
+  }
+}
+
+// src/core/derive.ts
+function createEmptyQualityProgress() {
+  return {
+    style: "pending",
+    architecture: "pending",
+    performance: "pending",
+    security: "pending",
+    maintainability: "pending"
+  };
+}
+function assertOrchestrator(ctx, toolName) {
+  if (!ctx.orchestrator) {
+    throw new Error(`工具 "${toolName}" 仅限编排者（主代理）调用，当前调用者为 "${ctx.agent}"。`);
+  }
+}
+function findTaskGroup(state, id) {
+  const item = state.workItems.find((w) => w.id === `task:${id}`);
+  if (!item)
+    throw new Error(`任务组 "${id}" 不在任务清单中。`);
+  return taskGroupFromWorkItem(item);
+}
+function childPhaseToIssueStatus(phase) {
+  switch (phase) {
+    case "done":
+      return "verified";
+    case "cancelled":
+      return "exempted";
+    case "review":
+      return "submitted";
+    default:
+      return "open";
+  }
+}
+function projectIssueFromChild(child) {
+  const f = resolveChildIssueFields(child);
+  const baseStatus = childPhaseToIssueStatus(child.phase);
+  const hasExemptRequest = child.metadata[EXEMPT_REQUEST_KEY] !== undefined;
+  return {
+    id: child.externalId ?? child.id.replace(/^issue:/, ""),
+    dimension: f.dimension,
+    sourcePhase: f.sourcePhase,
+    severity: child.severity ?? "Info",
+    file: f.file,
+    line: f.line,
+    description: child.description,
+    suggestion: typeof child.metadata["suggestion"] === "string" ? child.metadata["suggestion"] : "",
+    status: hasExemptRequest ? "exemption_requested" : baseStatus,
+    refixCount: typeof child.metadata["refix_count"] === "number" ? child.metadata["refix_count"] : 0,
+    rootCauseGuess: typeof child.metadata["root_cause_guess"] === "string" ? child.metadata["root_cause_guess"] : null,
+    exemptReason: typeof child.metadata["exempt_reason"] === "string" ? child.metadata["exempt_reason"] : null,
+    rejectReason: typeof child.metadata["reject_reason"] === "string" ? child.metadata["reject_reason"] : null,
+    rule: typeof child.metadata["rule"] === "string" ? child.metadata["rule"] : undefined
+  };
+}
+function workItemPhaseToTaskGroupStatus(phase) {
+  switch (phase) {
+    case "todo":
+      return "task_analysis";
+    case "in_progress":
+      return "dev_impl";
+    case "review":
+    case "done":
+      return "review";
+    default:
+      return "completed";
+  }
+}
+function taskGroupFromWorkItem(item) {
+  const m = item.metadata;
+  const tasks = taskListOf(item);
+  return {
+    id: item.externalId ?? item.id.replace(/^task:/, ""),
+    name: typeof m["name"] === "string" ? m["name"] : item.title,
+    taskCount: typeof m["task_count"] === "number" ? m["task_count"] : tasks.length,
+    worktreePath: typeof m["worktree_path"] === "string" ? m["worktree_path"] : null,
+    branchName: typeof m["branch_name"] === "string" ? m["branch_name"] : null,
+    baseRef: typeof m["base_ref"] === "string" ? m["base_ref"] : null,
+    executionBoundary: m["execution_boundary"] ?? null,
+    relevantSpecs: Array.isArray(m["relevant_specs"]) ? m["relevant_specs"] : [],
+    status: workItemPhaseToTaskGroupStatus(item.phase),
+    phases: {
+      architect_review: { completed: false },
+      review: {
+        retryCount: 0,
+        lastResolvedRetryCount: 0,
+        tool: { completed: false },
+        task: { completed: false },
+        quality: { progress: createEmptyQualityProgress() }
+      }
+    },
+    tasks,
+    issues: issueChildrenOf(item).map(projectIssueFromChild),
+    blockers: Array.isArray(m["blockers"]) ? m["blockers"] : [],
+    agentSummaries: typeof m["agent_summaries"] === "object" ? m["agent_summaries"] : undefined
+  };
+}
+
+// src/core/paths.ts
+import path4 from "node:path";
+function isPathWithin(base, target) {
+  const rel = path4.relative(path4.resolve(base), path4.resolve(base, target));
+  return rel === "" || !rel.startsWith("..") && !path4.isAbsolute(rel);
+}
+function assertPathWithin(base, target, subject) {
+  if (!isPathWithin(base, target)) {
+    throw new Error(`${subject}路径 "${target}" 超出允许目录（\`${path4.resolve(base)}\`），已拒绝。
+` + `路径必须位于该目录之内，禁止用 ".." 或绝对路径逃逸到主仓库/主分支。`);
+  }
+  return path4.resolve(base, target);
+}
+function assertIssueFilesWithin(issues, base) {
+  if (!base)
+    return;
+  for (const iss of issues) {
+    if (iss.file)
+      assertPathWithin(base, iss.file, "issue 文件");
+  }
+}
+
+// src/core/workflow/loader.ts
+import { readFileSync as readFileSync3, existsSync as existsSync4 } from "node:fs";
+import { dirname as dirname2, resolve as pathResolve } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+
 // src/skills/resolve.ts
 import { readdirSync as readdirSync3, readFileSync as readFileSync2, existsSync as existsSync3 } from "node:fs";
 import { resolve as resolve2 } from "node:path";
@@ -41342,8 +41422,9 @@ function renderProgressSection(item, workflow) {
     if (isTerminalPhase(phase.name))
       continue;
     for (const step of phase.steps) {
+      const stepLabel = step.id === "analyze" ? `\`${step.id}\`（提案期已替代；仅 blocker 回退时执行）` : `\`${step.id}\``;
       for (const agent of stepAgentIds(step)) {
-        lines.push(`| \`${step.id}\` | \`${agent}\` | ${getStepVerdict(item, step.id, agent)} |`);
+        lines.push(`| ${stepLabel} | \`${agent}\` | ${getStepVerdict(item, step.id, agent)} |`);
       }
     }
   }
@@ -41457,11 +41538,11 @@ function renderAgentWorking(item, rec, step, common2, ctxAgent, state, tg, mustD
   stepCtx["agent"] = ctxAgent;
   stepCtx["base_branch"] = state.baseBranch;
   const boundary = readExecutionBoundary(item);
-  if (boundary) {
-    stepCtx["allowed_directories"] = boundary.allowed_directories.join(", ");
-    stepCtx["allowed_packages"] = boundary.allowed_packages.join(", ");
-    stepCtx["notes"] = boundary.notes && boundary.notes.trim() !== "" ? boundary.notes : "无额外说明";
-  }
+  const boundaryDirs = boundary?.allowed_directories ?? [];
+  const boundaryPkgs = boundary?.allowed_packages ?? [];
+  stepCtx["allowed_directories"] = boundaryDirs.length > 0 ? boundaryDirs.join(", ") : boundary ? "整个 worktree（执行边界未限定目录）" : "整个 worktree（未从 clarify.md 解析到执行边界）";
+  stepCtx["allowed_packages"] = boundaryPkgs.length > 0 ? boundaryPkgs.join(", ") : boundary ? "不适用（执行边界未限定包）" : "不适用（未产出执行边界）";
+  stepCtx["notes"] = boundary?.notes?.trim() ? boundary.notes : "无额外说明";
   const lines = [
     "# ✅ 当前轮到你执行",
     "",
@@ -41569,10 +41650,11 @@ function renderStepContext(item, step, ctxAgent, state, exemptionCtx) {
   const lines = [];
   switch (stepContextKind(step.id)) {
     case "analyze":
-      lines.push(...renderAnalyzeMode(state));
+      lines.push(...renderConfirmMode(state));
       lines.push(...renderAnalyzeBlockers(item));
       break;
     case "implement":
+      lines.push(...renderConfirmMode(state));
       lines.push(...renderDeveloperChildren(item, ctxAgent, exemptionCtx));
       break;
     case "review_tool":
@@ -41621,7 +41703,7 @@ function readExecutionBoundary(item) {
   const raw = item.metadata["execution_boundary"];
   return typeof raw === "object" && raw !== null ? raw : null;
 }
-function renderAnalyzeMode(state) {
+function renderConfirmMode(state) {
   const unattended = state.unattended === true;
   return [
     "## 确认模式",
@@ -42020,6 +42102,27 @@ function migrateLegacyTasks(item) {
   }
   delete item.metadata["tasks"];
 }
+function hasUnresolvedBlocker(item) {
+  const raw = item.metadata["blockers"];
+  if (!Array.isArray(raw))
+    return false;
+  return raw.some((b) => b?.status !== "resolved");
+}
+function closeUnresolvedBlockers(item, reason) {
+  const raw = item.metadata["blockers"];
+  if (!Array.isArray(raw))
+    return 0;
+  let closed = 0;
+  for (const b of raw) {
+    if (!b || b.status === "resolved")
+      continue;
+    b.status = "resolved";
+    b.userResponse = reason;
+    b.architectConclusion = reason;
+    closed++;
+  }
+  return closed;
+}
 function firstUnpassedReviewStep(item, workflow) {
   const review = workflow.phases.find((p) => p.name === "review");
   if (!review)
@@ -42040,7 +42143,7 @@ function applyRecoveryState(item, recovery, parsedTasks, state) {
       item.phase = "in_progress";
       item.currentStep = "implement";
       item.tags = {};
-      return;
+      return 0;
     }
     item.phase = "review";
     item.tags["implement:openspec-developer"] = "passed";
@@ -42057,22 +42160,23 @@ function applyRecoveryState(item, recovery, parsedTasks, state) {
     item.currentStep = firstUnpassedReviewStep(item, workflow2);
     if (item.currentStep === null)
       item.phase = "done";
-    return;
+    return 0;
   }
   const mode = state.mode;
-  if (mode === "simple") {
-    const phase2 = recovery?.phase;
-    if (!phase2 || phase2 === "task_analysis" || phase2 === "dev_impl") {
-      item.phase = "in_progress";
-      item.currentStep = "implement";
-      item.tags = {};
-      if (!phase2 || phase2 === "task_analysis") {
-        syncTaskChildren(item, parsedTasks, { forceOpen: true });
-      } else {
-        syncTaskChildren(item, parsedTasks, { defaultStatus: "todo" });
-      }
-      return;
+  const phase = recovery?.phase;
+  if (!phase || phase === "task_analysis" || phase === "dev_impl") {
+    item.phase = "in_progress";
+    item.currentStep = "implement";
+    item.tags = {};
+    const closedBlockers = phase === "task_analysis" ? closeUnresolvedBlockers(item, "随任务组重制处理") : 0;
+    if (!phase || phase === "task_analysis") {
+      syncTaskChildren(item, parsedTasks, { forceOpen: true });
+    } else {
+      syncTaskChildren(item, parsedTasks, { defaultStatus: "todo" });
     }
+    return closedBlockers;
+  }
+  if (mode === "simple") {
     item.phase = "review";
     item.tags["implement:openspec-developer"] = "passed";
     for (const key of Object.keys(item.tags)) {
@@ -42095,25 +42199,9 @@ function applyRecoveryState(item, recovery, parsedTasks, state) {
       }
     }
     syncTaskChildren(item, parsedTasks, { defaultStatus: "done" });
-    return;
-  }
-  const phase = recovery?.phase;
-  if (!phase || phase === "task_analysis") {
-    item.phase = "todo";
-    item.currentStep = "analyze";
-    item.tags = {};
-    syncTaskChildren(item, parsedTasks, { forceOpen: true });
-    return;
-  }
-  if (phase === "dev_impl") {
-    item.phase = "in_progress";
-    item.currentStep = "implement";
-    item.tags = { "analyze:openspec-architect": "passed" };
-    syncTaskChildren(item, parsedTasks, { defaultStatus: "todo" });
-    return;
+    return 0;
   }
   item.phase = "review";
-  item.tags["analyze:openspec-architect"] = "passed";
   item.tags["implement:openspec-developer"] = "passed";
   for (const key of Object.keys(item.tags)) {
     if (key.startsWith("verify_tool:") || key.startsWith("verify_task:") || key.startsWith("verify_quality:")) {
@@ -42141,6 +42229,7 @@ function applyRecoveryState(item, recovery, parsedTasks, state) {
     }
   }
   syncTaskChildren(item, parsedTasks, { defaultStatus: "done" });
+  return 0;
 }
 function assertValidRecovery(recovery) {
   if (recovery === undefined)
@@ -42450,13 +42539,12 @@ function assertProjectStacks(args) {
     }
   }
 }
-async function resolveTasksContent(repoRoot, state, changeId, baseBranch) {
-  const rel = `openspec/changes/${changeId}/tasks.md`;
+async function resolveChangeDocContent(repoRoot, state, changeId, baseBranch, relPath) {
   if (state) {
     const item = state.workItems.find((w) => w.id === `task:${state.taskGroupId}`);
     const worktreePath = item && typeof item.metadata["worktree_path"] === "string" ? item.metadata["worktree_path"] : null;
     if (worktreePath) {
-      const p = path5.join(worktreePath, rel);
+      const p = path5.join(worktreePath, relPath);
       if (await pathExists(p)) {
         try {
           return await readFile4(p, "utf-8");
@@ -42464,13 +42552,13 @@ async function resolveTasksContent(repoRoot, state, changeId, baseBranch) {
       }
     }
   }
-  const mainPath = path5.join(repoRoot, rel);
+  const mainPath = path5.join(repoRoot, relPath);
   if (await pathExists(mainPath)) {
     try {
       return await readFile4(mainPath, "utf-8");
     } catch {}
   }
-  const shown = await runGitChecked(repoRoot, ["show", `${baseBranch}:${rel}`]);
+  const shown = await runGitChecked(repoRoot, ["show", `${baseBranch}:${relPath}`]);
   if (shown.success && shown.stdout.length > 0)
     return shown.stdout;
   return null;
@@ -42527,7 +42615,7 @@ async function initExecute(params, ctx) {
   const wasCurrentGroup = state?.taskGroupId === args.task_group_id;
   const stacksNote = state ? adoptOrAssertSessionStacks(state, args) : null;
   const fallbackBaseBranch = state?.baseBranch || baseBranch;
-  const tasksContent = await resolveTasksContent(ctx.worktree, state, changeId, fallbackBaseBranch);
+  const tasksContent = await resolveChangeDocContent(ctx.worktree, state, changeId, fallbackBaseBranch, `openspec/changes/${changeId}/tasks.md`);
   const parsedGroups = tasksContent === null ? [] : parseTaskGroupsFromContent(tasksContent);
   if (parsedGroups.length === 0) {
     throw new Error(`无法从 tasks.md 解析出任务组，请检查文件 openspec/changes/${changeId}/tasks.md。
@@ -42544,7 +42632,11 @@ async function initExecute(params, ctx) {
   for (const g of parsedGroups) {
     tasksByGroup.set(g.id, parseTasksForGroupFromContent(tasksContent, g.id));
   }
+  const clarifyContent = await resolveChangeDocContent(ctx.worktree, state, changeId, fallbackBaseBranch, `openspec/changes/${changeId}/clarify.md`);
+  const clarifyBoundary = clarifyContent === null ? null : parseExecutionBoundary(clarifyContent, args.task_group_id);
   let modeSwitchNote = null;
+  let legacyMigrationNote = null;
+  let blockerResetNote = null;
   if (state && args.mode !== undefined && args.mode !== (state.mode ?? "full")) {
     const othersSettled = otherTaskGroupsSettled(state, args.task_group_id);
     const withinWindow = (args.task_group_id !== state.taskGroupId || args.recovery?.phase === "task_analysis") && othersSettled;
@@ -42599,12 +42691,8 @@ async function initExecute(params, ctx) {
           description: group.name,
           labels: ["openspec-change"]
         });
-        if (state.mode === "simple") {
-          item2.phase = "in_progress";
-          item2.currentStep = "implement";
-        } else {
-          item2.currentStep = "analyze";
-        }
+        item2.phase = "in_progress";
+        item2.currentStep = "implement";
         syncTaskChildren(item2, groupTasks, { defaultStatus: "todo" });
         refreshMeta(item2);
         state.workItems.push(item2);
@@ -42615,6 +42703,23 @@ async function initExecute(params, ctx) {
       refreshMeta(existing);
       syncTaskChildren(existing, groupTasks, {});
       delete existing.metadata["_advance_block_reason"];
+      if (state.mode === "simple" && hasUnresolvedBlocker(existing)) {
+        const closed = closeUnresolvedBlockers(existing, "simple 模式已不支持 blocker 状态机，随初始化关闭");
+        blockerResetNote = `simple 模式已关闭 ${closed} 个未解决 blocker（旧版本遗留，随初始化处理）。`;
+      }
+      if (existing.phase === "todo" || existing.currentStep === "analyze") {
+        if (hasUnresolvedBlocker(existing)) {
+          legacyMigrationNote = "存在未解决 blocker，保留 analyze 回退步骤。";
+        } else {
+          existing.phase = "in_progress";
+          existing.currentStep = "implement";
+          for (const key of Object.keys(existing.tags)) {
+            if (key.startsWith("analyze:"))
+              delete existing.tags[key];
+          }
+          legacyMigrationNote = "已迁移旧在途会话：初始落点由 analyze 前移到 implement。";
+        }
+      }
       continue;
     }
     const item = existing ?? createInitialWorkItem({
@@ -42652,23 +42757,42 @@ async function initExecute(params, ctx) {
       item.metadata["branch_name"] = null;
       item.metadata["base_ref"] = null;
     }
-    applyRecoveryState(item, args.recovery, groupTasks, state);
+    const regroupBlockersClosed = applyRecoveryState(item, args.recovery, groupTasks, state);
+    if (regroupBlockersClosed > 0) {
+      blockerResetNote = `任务组重制已关闭 ${regroupBlockersClosed} 个未解决 blocker（随重制处理）。`;
+    }
     refreshMeta(item);
     if (!existing)
       state.workItems.push(item);
   }
   state.taskGroupId = args.task_group_id;
+  let boundaryNote;
+  const boundaryTarget = state.workItems.find((w) => w.id === `task:${args.task_group_id}`);
+  if (!clarifyBoundary) {
+    boundaryNote = "未从 clarify.md 解析到本任务组执行边界，实施视图按整个 worktree 处理。";
+  } else if (boundaryTarget && boundaryTarget.metadata["execution_boundary"] === undefined) {
+    boundaryTarget.metadata["execution_boundary"] = clarifyBoundary;
+    boundaryNote = "已从 clarify.md 写入本任务组执行边界。";
+  } else {
+    boundaryNote = "本任务组已存在执行边界（来自 analyze 回退修订或 reviewer 边界扩展），未用 clarify.md 覆盖。";
+  }
   await writeState(ctx.worktree, state);
   const parts = ["编排会话已初始化。"];
   if (args.recovery)
     parts.push(`已恢复到 ${args.recovery.phase} 阶段。`);
+  if (blockerResetNote)
+    parts.push(blockerResetNote);
   if (modeSwitchNote)
     parts.push(modeSwitchNote);
+  if (legacyMigrationNote)
+    parts.push(legacyMigrationNote);
   if (stacksNote)
     parts.push(stacksNote);
   parts.push(`
 
 - **基准分支**: \`${state.baseBranch}\``);
+  parts.push(`
+- **执行边界**: ${boundaryNote}`);
   if (args.recovery?.review_layer && (state.mode ?? "full") === "simple") {
     parts.push(`
 
@@ -43600,10 +43724,15 @@ function resetTasksForBlocker(item) {
   }
   clearReviewVerificationTags(item);
 }
-function handleAnalyzeParams(item, params) {
-  if (params.verdict === "passed" && !params.execution_boundary) {
-    throw new Error("analyze step 提交 passed 时必须提供 execution_boundary。");
+function assertBlockerUpdatable(blocker) {
+  const raw = blocker;
+  if (raw.status === undefined)
+    raw.status = "awaiting_user";
+  if (raw.status !== "awaiting_user") {
+    throw new Error(`blocker "${blocker.id}" 状态不是 awaiting_user，无法更新。`);
   }
+}
+function handleAnalyzeParams(item, params) {
   if (params.execution_boundary) {
     item.metadata["execution_boundary"] = params.execution_boundary;
   }
@@ -43614,8 +43743,7 @@ function handleAnalyzeParams(item, params) {
       const blocker = itemBlockers(item).find((b) => b.id === u.blocker_id);
       if (!blocker)
         throw new Error(`blocker "${u.blocker_id}" 不存在于 metadata.blockers 中。`);
-      if (blocker.status !== "awaiting_user")
-        throw new Error(`blocker "${u.blocker_id}" 状态不是 awaiting_user，无法更新。`);
+      assertBlockerUpdatable(blocker);
       blocker.userResponse = u.user_response;
       blocker.status = "resolved";
     }
@@ -43623,6 +43751,14 @@ function handleAnalyzeParams(item, params) {
   if (params.verdict === "passed" && itemBlockers(item).some((b) => b.status !== "resolved")) {
     throw new Error("存在未解决的 blocker，无法以 passed 提交 analyze step。请先通过 blocker_updates 处理全部 blocker。");
   }
+}
+function assertSimpleModeNoBlockerParams(params) {
+  if (!params.blocker && !params.blockers?.length)
+    return;
+  throw new Error(`simple 模式不走 blocker 状态机：implement 提交不接受 blocker / blockers 参数。
+` + `simple 流程没有 analyze 回退步骤，blocker 进入待裁决后没有裁决落点，后续 implement passed 会被未解决的 blocker 永久拦截。
+` + `遇阻塞时，应当场用 question 向用户确认（无人值守时按准则自行裁决），并把处理方式与结论写进 must_do_checks 对应项的 evidence；
+` + "需要架构裁决者裁决的场景请改用 full 模式（full 模式 blocker 会回退 analyze 裁决）。");
 }
 function handleImplementParams(item, params, mustDoContext) {
   if (params.blocker) {
@@ -43642,8 +43778,7 @@ function handleImplementParams(item, params, mustDoContext) {
       const blocker = itemBlockers(item).find((b) => b.id === u.blocker_id);
       if (!blocker)
         throw new Error(`blocker "${u.blocker_id}" 不存在于 metadata.blockers 中。`);
-      if (blocker.status !== "awaiting_user")
-        throw new Error(`blocker "${u.blocker_id}" 状态不是 awaiting_user，无法更新。`);
+      assertBlockerUpdatable(blocker);
       blocker.userResponse = u.user_response;
       blocker.status = "resolved";
     }
@@ -43976,6 +44111,9 @@ ${fileLines}
     } else if (stepPhase === "todo") {
       handleAnalyzeParams(item, params);
     } else if (stepPhase === "in_progress") {
+      if (state.mode === "simple" && params.step_id === "implement") {
+        assertSimpleModeNoBlockerParams(params);
+      }
       if (params.step_id === "implement" && (state.mode === "simple" || params.verdict === "passed")) {
         const clean = await isWorktreeClean(wtPath);
         if (!clean) {
@@ -44021,12 +44159,13 @@ ${fileLines}
         autoCommitLines.push(`- ⚠️ 存在未跟踪的非文档类文件未纳入自动提交（文档类已自动提交；这些须由编排者/开发者自行处理）：${ac.untrackedFiles.join("、")}`);
       }
     }
-    if (stepPhase === "todo" && params.step_id === "analyze" && params.verdict === "passed" && wtPath && typeof item.metadata["branch_name"] === "string") {
+    if (stepPhase === "in_progress" && params.step_id === "implement" && params.verdict === "passed" && wtPath && typeof item.metadata["branch_name"] === "string" && item.metadata["_main_pollution_reconciled"] !== true) {
       const baseRef = typeof item.metadata["base_ref"] === "string" ? item.metadata["base_ref"] : null;
       await reconcileMainPollution(ctx.worktree, wtPath, {
         changeId: state.changeId,
         baseRef
       });
+      item.metadata["_main_pollution_reconciled"] = true;
     }
     if (params.step_id === "verify_tool" && agentToReviewLayer(ctx.agent) === "tool" || params.step_id === "quality_review" && ctx.agent === "openspec-reviewer") {
       const head = await getCurrentHead(wtPath);
@@ -44347,7 +44486,11 @@ var recoverySchema = {
   type: "object",
   description: "进度恢复参数。提供后按 phase 恢复阶段状态，< phase 为 completed，== phase 为 in_progress，> phase 为 not_started。",
   properties: {
-    phase: { type: "string", enum: ["task_analysis", "dev_impl", "review"], description: "恢复到哪个阶段" },
+    phase: {
+      type: "string",
+      enum: ["task_analysis", "dev_impl", "review"],
+      description: "恢复到哪个阶段。task_analysis 在 full 下等同 dev_impl（重置本组任务进度并从 implement 开始），仍用于重制任务组与模式切换窗口"
+    },
     review_layer: {
       type: "string",
       enum: ["tool", "task", "quality"],
@@ -44396,7 +44539,7 @@ var orchInitSchema = {
     mode: {
       type: "string",
       enum: ["full", "simple"],
-      description: "流程模式选择（仅 change 会话入口有效，独立审查会话不使用）：full=完整流程（analyze→implement→三重审查+收尾验证）；simple=精简流程（implement→quality_review→done，verify_cleanup 仅作收口漂移/冲突回退落点，正常流转不经过，缺省）。首次新建编排状态时固化；已开始的变更仅在允许窗口内可更新：切换任务组（其他任务组均已完成或从未激活）或 recovery.phase=task_analysis 重制当前组（其他任务组同样须已完成或从未激活）；其余场景传不同 mode 将报错。"
+      description: "流程模式选择（仅 change 会话入口有效，独立审查会话不使用）：full=完整流程（implement→三重审查+收尾验证）；simple=精简流程（implement→quality_review→done，verify_cleanup 仅作收口漂移/冲突回退落点，正常流转不经过，缺省）。首次新建编排状态时固化；已开始的变更仅在允许窗口内可更新：切换任务组（其他任务组均已完成或从未激活）或 recovery.phase=task_analysis 重制当前组（其他任务组同样须已完成或从未激活）；其余场景传不同 mode 将报错。"
     },
     review_scope: {
       type: "object",
@@ -44513,7 +44656,7 @@ var agentSubmitSchema = {
     },
     execution_boundary: {
       ...executionBoundarySchema,
-      description: "analyze step：架构预检产出的执行边界（verdict=passed 必传）"
+      description: "analyze 回退（blocker 裁决）时的执行边界修订（可选）"
     },
     blockers: { type: "array", description: "analyze step：新增 blocker 列表", items: blockerItem },
     blocker_updates: {
@@ -44571,7 +44714,7 @@ var agentSubmitSchema = {
 var OPX_TOOL_SPECS = [
   {
     name: "opx_orch_init",
-    description: "初始化编排会话。project_stacks 与 project_frameworks 必传（change 入口与 review_scope 独立审查入口均需要）：声明项目形态栈与框架栈，每个值须命中当前 skill 索引中 skill frontmatter 声明的 stacks / frameworks 标签（动态校验，无硬编码值域），作为 skill 加载清单过滤与 step 必做清单分组的过滤基准，与 change_id 同生命周期持久化（recovery 恢复时同样必传）。传入变更 ID 和任务组 ID，工具自动解析 tasks.md 提取全部任务组并解析目标组子任务。可通过 recovery 参数恢复到指定阶段。无 recovery 重复初始化当前任务组时保留其阶段和进度；切换到其它任务组时初始化该组。可选 mode 参数（full/simple，缺省 simple）选择流程模式：首次新建状态时固化；已开始的变更仅切组（其他任务组均已完成或从未激活）或 recovery.phase=task_analysis 重制当前组（其他任务组同样须已完成或从未激活）时可更新，其余场景传不同 mode 报错。",
+    description: "初始化编排会话。project_stacks 与 project_frameworks 必传（change 入口与 review_scope 独立审查入口均需要）：声明项目形态栈与框架栈，每个值须命中当前 skill 索引中 skill frontmatter 声明的 stacks / frameworks 标签（动态校验，无硬编码值域），作为 skill 加载清单过滤与 step 必做清单分组的过滤基准，与 change_id 同生命周期持久化（recovery 恢复时同样必传）。传入变更 ID 和任务组 ID，工具自动解析 tasks.md 提取全部任务组并解析目标组子任务，同时自动从 clarify.md 解析当前任务组执行边界写入状态，缺失时按整个 worktree 处理。可通过 recovery 参数恢复到指定阶段。无 recovery 重复初始化当前任务组时保留其阶段和进度；切换到其它任务组时初始化该组。可选 mode 参数（full/simple，缺省 simple）选择流程模式：full=完整流程（implement→三重审查+收尾验证，analyze 仅作 implement 上报 blocker 后的裁决回退落点）；simple=精简流程（implement→quality_review→done，不走 blocker 状态机）。首次新建状态时固化；已开始的变更仅切组（其他任务组均已完成或从未激活）或 recovery.phase=task_analysis 重制当前组（其他任务组同样须已完成或从未激活）时可更新，其余场景传不同 mode 报错。",
     schema: orchInitSchema
   },
   {
@@ -44581,7 +44724,7 @@ var OPX_TOOL_SPECS = [
   },
   {
     name: "opx_status",
-    description: "统一状态/上下文查询（只读为主）。按调用者角色路由：编排视角→统计+worktree；architect→spec/blocker；developer→worktree/boundary/task/issue；reviewer-tool→tool 层控件 issue；reviewer-task→task 验证状态；quality reviewer→自维度既有 issue。",
+    description: "统一状态/上下文查询（只读为主）。按调用者角色路由：编排视角→统计+worktree；architect→架构裁决视图（待处理 blocker 与执行边界，仅 blocker 回退时呈现）；developer→worktree/boundary/task/issue；reviewer-tool→tool 层控件 issue；reviewer-task→task 验证状态；quality reviewer→自维度既有 issue。",
     schema: statusSchema
   },
   {
@@ -44591,7 +44734,7 @@ var OPX_TOOL_SPECS = [
   },
   {
     name: "opx_orch_set_unattended",
-    description: "开启/关闭无人值守模式。开启后编排流程不再向用户提问：analyze 确认模式由架构师自行裁决（不确认用户）；重试检查点、状态异常、blocker 处理等需拍板事项由主代理按编排行为准则自行决策并提交——检查点决策是 opx_agent_submit 工具调用，主代理可自行执行，不因无人值守而抑制。",
+    description: "开启/关闭无人值守模式。开启后编排流程不再向用户提问：blocker 裁决与实施阶段的确认模式转为自行决策（架构裁决者裁决 blocker、开发者遇阻塞自行选择最优解，均不向用户确认）；重试检查点、状态异常等需拍板事项由主代理按编排行为准则自行决策并提交——检查点决策是 opx_agent_submit 工具调用，主代理可自行执行，不因无人值守而抑制。",
     schema: setUnattendedSchema
   },
   {
@@ -44642,7 +44785,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "1.2.0";
+var PKG_VERSION = "1.3.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
