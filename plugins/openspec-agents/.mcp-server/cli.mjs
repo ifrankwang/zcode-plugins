@@ -35711,6 +35711,47 @@ async function autoCommitWorktreeChanges(wtPath, agent, stepId) {
   }
   return { status: "committed", files: committedFiles, untrackedFiles: untrackedOtherFiles };
 }
+var defaultOpenSpecCliRunner = (cwd, args) => new Promise((resolve) => {
+  execFile("openspec", args, { cwd, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+    if (err && err.code === "ENOENT") {
+      resolve({ success: false, stdout: "", stderr: "ENOENT" });
+      return;
+    }
+    resolve({ success: !err, stdout: stdout || "", stderr: stderr || (err ? String(err.message) : "") });
+  });
+});
+var openspecCliRunner = defaultOpenSpecCliRunner;
+async function archiveOpenspecChange(worktreePath, changeId, opts = {}) {
+  const runCli = opts.runCli ?? openspecCliRunner;
+  const changeDir = path.join(worktreePath, "openspec", "changes", changeId);
+  if (!await pathExists(changeDir)) {
+    return { status: "skipped", reason: "change 目录不存在（可能已归档）" };
+  }
+  const cliRes = await runCli(worktreePath, ["archive", changeId, "-y", "--json"]);
+  if (cliRes.stderr.includes("ENOENT")) {
+    return { status: "skipped", reason: "openspec CLI 未安装" };
+  }
+  if (!cliRes.success) {
+    const summary = (cliRes.stderr || cliRes.stdout).trim();
+    return { status: "failed", error: summary.length > 0 ? summary.slice(0, 500) : `openspec archive ${changeId} 退出码非零` };
+  }
+  const statusRes = await runGitChecked(worktreePath, ["status", "--porcelain", "openspec"]);
+  if (!statusRes.success) {
+    return { status: "failed", error: `归档后 git status 查询失败：${statusRes.stderr}` };
+  }
+  if (statusRes.stdout.length === 0) {
+    return { status: "archived", committed: false };
+  }
+  const addRes = await runGitChecked(worktreePath, ["add", "openspec"]);
+  if (!addRes.success) {
+    return { status: "failed", error: `归档产物 git add 失败：${addRes.stderr}` };
+  }
+  const commitRes = await runGitChecked(worktreePath, ["commit", "-m", `chore(openspec): archive change ${changeId}`]);
+  if (!commitRes.success) {
+    return { status: "failed", error: `归档产物 git commit 失败：${commitRes.stderr}` };
+  }
+  return { status: "archived", committed: true };
+}
 
 // src/core/state.ts
 import path2 from "path";
@@ -41196,7 +41237,7 @@ function renderDeploymentNotesSection(state, item, caller) {
     "",
     "向用户汇报本次变更的部署注意事项：",
     "",
-    `- 阅读主仓库 \`openspec/changes/${state.changeId}/\` 下规划文档（design.md、tasks.md、proposal.md、specs/）提取部署要点：数据/结构变更脚本执行、消息队列/缓存等中间件配置调整、新增配置项或功能开关、外部接口契约变化、依赖清单/构建配置变更（合并后需在主仓库重装依赖、重新构建）`,
+    `- 阅读主仓库 \`openspec/changes/${state.changeId}/\` 下规划文档（design.md、tasks.md、proposal.md、specs/）提取部署要点：数据/结构变更脚本执行、消息队列/缓存等中间件配置调整、新增配置项或功能开关、外部接口契约变化、依赖清单/构建配置变更（合并后需在主仓库重装依赖、重新构建）。该目录在收口时会被 openspec archive 归档，归档后文档位于 \`openspec/changes/archive/\` 下`,
     "- 无规划文档时跳过文档提取，仅转述下方实施补充点",
     ""
   ];
@@ -43423,6 +43464,25 @@ async function completeTaskGroupLocked(params, ctx) {
       checkboxWarning = `- **tasks.md 复选框勾选失败**: ${e instanceof Error ? e.message : String(e)}（不影响收尾）`;
     }
   }
+  let archiveNote = "";
+  if (!isReview && isFinalTaskGroup(state, item) && worktreePath && branchName) {
+    const archiveRes = await archiveOpenspecChange(worktreePath, params.change_id);
+    if (archiveRes.status === "archived") {
+      archiveNote = `- **归档**: change 已通过 openspec archive 归档并提交（committed: ${archiveRes.committed ? "是" : "否"}）。`;
+    } else if (archiveRes.status === "skipped") {
+      archiveNote = `- **归档跳过**: ${archiveRes.reason}（不影响收口）。`;
+    } else {
+      const workflow = loadWorkflowFile(resolveWorkflowPath(state));
+      const rolledBack = rollbackToCleanupStep(item, workflow);
+      if (rolledBack)
+        await writeState(ctx.worktree, state);
+      return renderFinalizeBlocked([`openspec 归档失败：${archiveRes.error}`], [
+        `在 worktree 内检查 \`git status\`：如归档残留未提交文件，视情况提交或还原，使 worktree 恢复干净。`,
+        `归档依赖 git 身份（user.name/user.email），缺失时先配置再重试。`,
+        `处理完成后重新提交收尾验证（opx_agent_submit，step_id="verify_cleanup"），通过后再调用 opx_orch_complete_task_group 重新收口（二次收口时归档幂等跳过）。`
+      ], { branchName, mergeTarget: state.baseBranch, rolledBack, checkboxWarning });
+    }
+  }
   if (!isReview && worktreePath && branchName) {
     const endOid = (await runGit(worktreePath, ["rev-parse", branchName])).trim();
     if (endOid)
@@ -43507,7 +43567,7 @@ ${checkboxWarning}` : doneMessage2;
   }
   item.metadata["completed_at"] = new Date().toISOString();
   await writeState(ctx.worktree, state);
-  const notes = [docDriftNote, cleanupNote, checkboxWarning, cleanupResidualWarning].filter(Boolean);
+  const notes = [docDriftNote, cleanupNote, archiveNote, checkboxWarning, cleanupResidualWarning].filter(Boolean);
   const doneMessage = branchName ? `任务组已完成并合并到 "${mergeTarget}"。` : "任务组已完成（无变更分支引用，跳过合并）。";
   return notes.length > 0 ? `${doneMessage}
 ${notes.join(`
@@ -44785,7 +44845,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "1.3.0";
+var PKG_VERSION = "1.4.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
