@@ -35001,9 +35001,10 @@ var EMPTY_COMPLETION_RESULT = {
 };
 
 // src/core/tools/lifecycle.ts
-import path5 from "path";
+import path6 from "path";
 import { createHash as createHash2 } from "node:crypto";
-import { copyFile, mkdir, readdir, readFile as readFile4, rmdir, rm as rm2 } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile as readFile5, rmdir, rm as rm2 } from "node:fs/promises";
+import { existsSync as existsSync5 } from "node:fs";
 
 // src/core/types.ts
 var CODE_DIMENSIONS = ["style", "architecture", "performance", "security", "maintainability"];
@@ -35500,6 +35501,15 @@ function parsePorcelainPaths(out) {
     return f.replace(/^"+|"+$/g, "");
   });
 }
+async function listStagedPathsOutside(worktree, allowedPaths) {
+  const cachedOut = await runGit(worktree, ["diff", "--cached", "--name-only"]);
+  const staged = cachedOut.split(`
+`).map((l) => l.trim()).filter(Boolean);
+  return staged.filter((p) => !allowedPaths.some((a) => {
+    const dir = a.replace(/\/+$/, "");
+    return p === dir || p.startsWith(`${dir}/`);
+  }));
+}
 async function resolveMainRepoRoot(worktreePath) {
   try {
     const st = await stat(path.join(worktreePath, ".git"));
@@ -35599,9 +35609,7 @@ async function reconcileMainPollution(mainRepo, worktreePath, opts) {
     return [];
   let staged = false;
   try {
-    const cachedOut = await runGit(mainRepo, ["diff", "--cached", "--name-only"]);
-    const stagedOutside = cachedOut.split(`
-`).map((l) => l.trim()).filter(Boolean).filter((p) => p !== changeDir && !p.startsWith(`${changeDir}/`));
+    const stagedOutside = await listStagedPathsOutside(mainRepo, [changeDir]);
     if (stagedOutside.length > 0) {
       throw new Error(`主仓库 index 除 \`${changeDir}\` 外存在其它已暂存内容，拒绝自动合并污染文档：
 ` + stagedOutside.map((p) => `- \`${p}\``).join(`
@@ -36743,10 +36751,163 @@ function releaseLock(lockPath) {
   } catch {}
 }
 
+// src/core/gitignore.ts
+import path3 from "node:path";
+import { readFile as readFile3, writeFile as writeFile3 } from "node:fs/promises";
+var GENERATED_DIR_ENTRIES = [".worktree/", "openspec/states/"];
+var GITIGNORE_REL = ".gitignore";
+var COMMIT_MESSAGE = "chore(gitignore): ignore openspec orchestration artifacts";
+function normalizeEntry(line) {
+  return line.trim().replace(/\/+$/, "");
+}
+function explicitlyCovered(content) {
+  const wanted = new Set(GENERATED_DIR_ENTRIES.map(normalizeEntry));
+  const covered = new Set;
+  const negated = new Set;
+  for (const raw of content.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === "" || line.startsWith("#"))
+      continue;
+    const isNegation = line.startsWith("!");
+    const normalized = normalizeEntry(isNegation ? line.slice(1) : line);
+    if (!wanted.has(normalized))
+      continue;
+    if (isNegation)
+      negated.add(normalized);
+    else
+      covered.add(normalized);
+  }
+  for (const n of negated)
+    covered.delete(n);
+  return covered;
+}
+async function probeIgnoreSources(repoRoot) {
+  const notes = [];
+  for (const entry of GENERATED_DIR_ENTRIES) {
+    const out = await runGit(repoRoot, ["check-ignore", "-v", "--", entry]);
+    const firstLine = out.split(`
+`)[0]?.trim() ?? "";
+    const source = firstLine ? firstLine.split(":")[0] : "";
+    notes.push(source === GITIGNORE_REL ? `\`${entry}\` 命中来源 \`${GITIGNORE_REL}\`` : `\`${entry}\` 未确认命中来源`);
+  }
+  return notes;
+}
+function appendMissing(before, missing) {
+  if (missing.length === 0)
+    return before ?? "";
+  if (before === null || before.trim() === "")
+    return `${missing.join(`
+`)}
+`;
+  const eol = before.includes(`\r
+`) ? `\r
+` : `
+`;
+  const hasTrailingNewline = /\r?\n$/.test(before);
+  const head = hasTrailingNewline ? before : `${before}${eol}`;
+  return `${head}${missing.join(eol)}${eol}`;
+}
+async function precheckCommit(repoRoot, opts, beforeExists) {
+  if (opts.skipCommit) {
+    return { allowed: false, reason: "当前会话为只审不修的独立审查会话，跳过版本库提交", willBeUntracked: false };
+  }
+  const currentBranch = (await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
+  if (currentBranch === "" || currentBranch === "HEAD") {
+    return { allowed: false, reason: "当前处于 detached HEAD，无法确认提交目标分支", willBeUntracked: false };
+  }
+  const effectiveBase = opts.baseBranch ?? currentBranch;
+  if (currentBranch !== effectiveBase) {
+    return {
+      allowed: false,
+      reason: `当前检出分支 \`${currentBranch}\` 与基准分支 \`${effectiveBase}\` 不同`,
+      willBeUntracked: false
+    };
+  }
+  const statusOut = await runGit(repoRoot, ["status", "--porcelain", "--", GITIGNORE_REL]);
+  const entries = statusOut.split(`
+`).map((l) => l.trim()).filter(Boolean);
+  const untrackedOnly = entries.length === 1 && /^\?\?\s+\.gitignore$/.test(entries[0]);
+  let willBeUntracked = false;
+  let userDirty = false;
+  if (!beforeExists) {
+    willBeUntracked = entries.length === 0;
+    userDirty = entries.length > 0;
+  } else if (entries.length === 0) {
+    willBeUntracked = false;
+  } else if (untrackedOnly) {
+    willBeUntracked = true;
+  } else {
+    userDirty = true;
+  }
+  if (userDirty) {
+    return {
+      allowed: false,
+      reason: `\`${GITIGNORE_REL}\` 存在用户其它未提交改动，提交会夹带非本次内容`,
+      willBeUntracked: false
+    };
+  }
+  const stagedOutside = await listStagedPathsOutside(repoRoot, [GITIGNORE_REL]);
+  if (stagedOutside.length > 0) {
+    return {
+      allowed: false,
+      reason: "主仓库暂存区含其它已暂存改动，提交会夹带非本次内容",
+      willBeUntracked: false
+    };
+  }
+  return { allowed: true, reason: "", willBeUntracked };
+}
+async function ensureGeneratedDirsIgnored(repoRoot, opts = {}) {
+  const gitignorePath = path3.join(repoRoot, GITIGNORE_REL);
+  let before = null;
+  try {
+    before = await readFile3(gitignorePath, "utf-8");
+  } catch {
+    before = null;
+  }
+  const beforeExists = before !== null;
+  const covered = explicitlyCovered(before ?? "");
+  const probeNotes = await probeIgnoreSources(repoRoot);
+  const missing = GENERATED_DIR_ENTRIES.filter((e) => !covered.has(normalizeEntry(e)));
+  const precheck = await precheckCommit(repoRoot, opts, beforeExists);
+  const needCommit = missing.length > 0 || precheck.willBeUntracked;
+  if (missing.length > 0) {
+    await writeFile3(gitignorePath, appendMissing(before, missing), "utf-8");
+  }
+  const addedNote = missing.length > 0 ? `本次补齐：${missing.map((e) => `\`${e}\``).join("、")}` : "条目齐全，未改动文件";
+  const lines = [
+    `- **生成目录忽略**: 已写入并生效（${addedNote}）。`,
+    `- **辅助校验**: ${probeNotes.join("；")}。`
+  ];
+  if (!precheck.allowed || !needCommit) {
+    const reason = !precheck.allowed ? precheck.reason : "条目已纳入版本库，无变更需要提交";
+    lines.push(`- **版本库提交**: 未提交（原因：${reason}）；已生效、未提交。`);
+    return lines.join(`
+`);
+  }
+  if (precheck.willBeUntracked) {
+    const addRes = await runGitChecked(repoRoot, ["add", "-N", "--", GITIGNORE_REL]);
+    if (!addRes.success) {
+      lines.push(`- **版本库提交**: 未提交（原因：\`git add -N\` 失败：${addRes.stderr}）；已生效、未提交。`);
+      return lines.join(`
+`);
+    }
+  }
+  const commitRes = await runGitChecked(repoRoot, ["commit", "-m", COMMIT_MESSAGE, "--only", "--", GITIGNORE_REL]);
+  if (!commitRes.success) {
+    lines.push(`- **版本库提交**: 未提交（原因：\`git commit --only\` 失败：${commitRes.stderr}）；已生效、未提交。`);
+    return lines.join(`
+`);
+  }
+  const oid = (await runGit(repoRoot, ["rev-parse", "--verify", "HEAD"])).trim();
+  lines.push(`- **版本库提交**: 已原子提交，仅含 \`${GITIGNORE_REL}\` 一处变更（commit \`${oid}\`，消息 \`${COMMIT_MESSAGE}\`）。`);
+  return lines.join(`
+`);
+}
+
 // src/core/exemptions.ts
-import path3 from "path";
+import path4 from "path";
 import { mkdirSync as mkdirSync2, writeFileSync as writeFileSync2, renameSync } from "node:fs";
-import { readFile as readFile3 } from "node:fs/promises";
+import { readFile as readFile4 } from "node:fs/promises";
 
 // src/core/workflow/reset.ts
 function resolveChildIssueFields(child) {
@@ -36818,9 +36979,9 @@ async function exemptionsDir(worktree) {
   return getStateDir(root);
 }
 async function readExemptions(worktree) {
-  const fp = path3.join(await exemptionsDir(worktree), EXEMPTIONS_FILE);
+  const fp = path4.join(await exemptionsDir(worktree), EXEMPTIONS_FILE);
   try {
-    const parsed = JSON.parse(await readFile3(fp, "utf-8"));
+    const parsed = JSON.parse(await readFile4(fp, "utf-8"));
     if (parsed && Array.isArray(parsed.items)) {
       return { version: parsed.version ?? EXEMPTIONS_SCHEMA_VERSION, items: parsed.items };
     }
@@ -36832,15 +36993,15 @@ async function readExemptions(worktree) {
 async function writeExemptions(worktree, store) {
   const dir = await exemptionsDir(worktree);
   mkdirSync2(dir, { recursive: true });
-  const target = path3.join(dir, EXEMPTIONS_FILE);
-  const tmp = path3.join(dir, `${EXEMPTIONS_FILE}.tmp`);
+  const target = path4.join(dir, EXEMPTIONS_FILE);
+  const tmp = path4.join(dir, `${EXEMPTIONS_FILE}.tmp`);
   writeFileSync2(tmp, JSON.stringify(store, null, 2));
   renameSync(tmp, target);
 }
 async function upsertExemption(worktree, record3) {
   const dir = await exemptionsDir(worktree);
   mkdirSync2(dir, { recursive: true });
-  const lockPath = path3.join(dir, EXEMPTIONS_LOCK);
+  const lockPath = path4.join(dir, EXEMPTIONS_LOCK);
   await acquireLock(lockPath);
   try {
     const store = await readExemptions(worktree);
@@ -40269,17 +40430,17 @@ function taskGroupFromWorkItem(item) {
 }
 
 // src/core/paths.ts
-import path4 from "node:path";
+import path5 from "node:path";
 function isPathWithin(base, target) {
-  const rel = path4.relative(path4.resolve(base), path4.resolve(base, target));
-  return rel === "" || !rel.startsWith("..") && !path4.isAbsolute(rel);
+  const rel = path5.relative(path5.resolve(base), path5.resolve(base, target));
+  return rel === "" || !rel.startsWith("..") && !path5.isAbsolute(rel);
 }
 function assertPathWithin(base, target, subject) {
   if (!isPathWithin(base, target)) {
-    throw new Error(`${subject}路径 "${target}" 超出允许目录（\`${path4.resolve(base)}\`），已拒绝。
+    throw new Error(`${subject}路径 "${target}" 超出允许目录（\`${path5.resolve(base)}\`），已拒绝。
 ` + `路径必须位于该目录之内，禁止用 ".." 或绝对路径逃逸到主仓库/主分支。`);
   }
-  return path4.resolve(base, target);
+  return path5.resolve(base, target);
 }
 function assertIssueFilesWithin(issues, base) {
   if (!base)
@@ -40575,49 +40736,49 @@ function assertMustDoCatalogReferenced(catalog, workflows) {
 function fail(message) {
   throw new Error(message);
 }
-function expectString(value, path5) {
+function expectString(value, path6) {
   if (typeof value !== "string" || value.trim() === "") {
-    fail(`workflow 配置非法：${path5} 必须是非空字符串，收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path6} 必须是非空字符串，收到 ${JSON.stringify(value)}`);
   }
   return value;
 }
-function expectPositiveInt(value, path5) {
+function expectPositiveInt(value, path6) {
   if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-    fail(`workflow 配置非法：${path5} 必须是正整数，收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path6} 必须是正整数，收到 ${JSON.stringify(value)}`);
   }
   return value;
 }
-function expectStringArray(value, path5) {
+function expectStringArray(value, path6) {
   if (!Array.isArray(value) || value.length === 0 || value.some((v) => typeof v !== "string")) {
-    fail(`workflow 配置非法：${path5} 必须是非空字符串数组，收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path6} 必须是非空字符串数组，收到 ${JSON.stringify(value)}`);
   }
   return value;
 }
-function expectAgentList(value, path5) {
+function expectAgentList(value, path6) {
   if (!Array.isArray(value) || value.length === 0) {
-    fail(`workflow 配置非法：${path5} 必须是非空对象数组（每个元素含 id 与 capability_tags），收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path6} 必须是非空对象数组（每个元素含 id 与 capability_tags），收到 ${JSON.stringify(value)}`);
   }
   return value.map((v, i) => {
     if (typeof v !== "object" || v === null || Array.isArray(v)) {
-      fail(`workflow 配置非法：${path5}[${i}] 必须是对象（含 id 与 capability_tags），收到 ${JSON.stringify(v)}`);
+      fail(`workflow 配置非法：${path6}[${i}] 必须是对象（含 id 与 capability_tags），收到 ${JSON.stringify(v)}`);
     }
     const a = v;
     return {
-      id: expectString(a.id, `${path5}[${i}].id`),
-      capability_tags: expectStringArray(a.capability_tags, `${path5}[${i}].capability_tags`)
+      id: expectString(a.id, `${path6}[${i}].id`),
+      capability_tags: expectStringArray(a.capability_tags, `${path6}[${i}].capability_tags`)
     };
   });
 }
-function expectOptionalPositiveInt(value, path5) {
+function expectOptionalPositiveInt(value, path6) {
   if (value === undefined)
     return;
-  return expectPositiveInt(value, path5);
+  return expectPositiveInt(value, path6);
 }
-function expectOptionalNonEmptyStringArray(value, path5) {
+function expectOptionalNonEmptyStringArray(value, path6) {
   if (value === undefined)
     return;
   if (!Array.isArray(value) || value.length === 0 || value.some((v) => typeof v !== "string" || v.trim() === "")) {
-    fail(`workflow 配置非法：${path5} 必须是非空字符串数组，收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path6} 必须是非空字符串数组，收到 ${JSON.stringify(value)}`);
   }
   return value;
 }
@@ -40818,6 +40979,7 @@ function resolveStepMustDo(step, session) {
   return out;
 }
 var NO_CHANGE_TOKEN = "no_change";
+var NO_CHANGE_EXEMPTED_ITEMS = ["dimension_skill_review"];
 function hasNoChangeDeclaration(checks4) {
   return (checks4 ?? []).some((c) => stepToken(c.step) === NO_CHANGE_TOKEN);
 }
@@ -40827,7 +40989,7 @@ function uncoveredMustDo(step, checks4, session) {
     return [];
   const list = checks4 ?? [];
   if (hasNoChangeDeclaration(list))
-    return [];
+    return uncoveredUnderNoChange(must, list);
   const covered = new Set;
   for (const c of list) {
     const token = stepToken(c.step);
@@ -40842,6 +41004,15 @@ function mustDoChecksOfStep(metadata, stepId) {
     return [];
   const list = raw[stepId];
   return Array.isArray(list) ? list : [];
+}
+function uncoveredUnderNoChange(must, list) {
+  const covered = new Set;
+  for (const c of list) {
+    const token = stepToken(c.step);
+    if (NO_CHANGE_EXEMPTED_ITEMS.includes(token))
+      covered.add(token);
+  }
+  return must.filter((m) => NO_CHANGE_EXEMPTED_ITEMS.includes(m) && !covered.has(m));
 }
 function assertMustDoChecksFormat(checks4) {
   for (const c of checks4) {
@@ -40865,8 +41036,13 @@ function assertMustDoCoverage(requiredItems, checks4) {
   assertMustDoChecksFormat(list);
   if (requiredItems.length === 0)
     return;
-  if (hasNoChangeDeclaration(list))
-    return;
+  if (hasNoChangeDeclaration(list)) {
+    const missing2 = uncoveredUnderNoChange(requiredItems, list);
+    if (missing2.length === 0)
+      return;
+    throw new Error(`no_change 整体豁免不覆盖以下核对类必做项（其核对对象不依赖本轮变更）：${missing2.join("、")}。
+` + `请逐项单独申报：completed=true 附核对对象与结论记录，或 completed=false + 合法结构化 skip_reason ` + `（格式：${SKIP_REASON_FORMAT}）。`);
+  }
   const covered = new Set;
   for (const c of list) {
     const token = stepToken(c.step);
@@ -40877,7 +41053,7 @@ function assertMustDoCoverage(requiredItems, checks4) {
   if (missing.length === 0)
     return;
   throw new Error(`提交的必做项申报未覆盖本 step 的必做清单，缺少以下必做项：${missing.join("、")}。
-` + `请按本 step 必做清单逐项执行并逐项申报结果（completed=true + evidence）；` + `确实无法执行的必做项须以 completed=false + 结构化 skip_reason 申报降级理由` + `（格式：${SKIP_REASON_FORMAT}）。` + `低成本必做项必须实跑后申报；核验申报仅限 workflow 指令白名单限定的高成本必做项。`);
+` + `请按本 step 必做清单逐项执行并逐项申报结果（completed=true + evidence）；` + `确实无法执行的必做项须以 completed=false + 结构化 skip_reason 申报降级理由` + `（格式：${SKIP_REASON_FORMAT}）。` + `申报口径分三类：工具实跑申报（低成本项必须实跑后申报）、核验申报（仅限 workflow 指令白名单限定的` + `高成本必做项，附核验方式与抽验样本）、人工核对申报（核对类必做项，附核对对象与结论记录）。`);
 }
 
 // src/core/views.ts
@@ -41619,12 +41795,10 @@ function renderAgentWorking(item, rec, step, common2, ctxAgent, state, tg, mustD
   lines.push(...renderSkillSuggestions(ctxAgent, caps, state.stacks ?? null));
   lines.push("## 操作指引", "");
   let n = 0;
-  lines.push(`${n++}. 按上方「Skill 加载清单」逐项加载列出的 skill（不可跳步）`);
   if (tg.worktreePath && tg.baseRef) {
     lines.push(`${n++}. 用上方「变更范围」命令获取本任务组的已提交变更文件清单，作为本次实施/修改范围；审查/报告范围以当前 step 指令为准`);
   }
   lines.push(`${n++}. 执行当前 step（\`${rec.stepId}\`）职责范围内的全部工作——遵循所有已加载 skill 的全部规范与约束`);
-  lines.push(`${n++}. 逐项检视所有已加载 skill 的 MUST 规范，确认全部满足（不满足则补做，不得跳过）`);
   for (const instruction of common2?.instructions ?? []) {
     lines.push(`${n++}. ${interpolateText(instruction, stepCtx)}`);
   }
@@ -41653,18 +41827,20 @@ function renderMustDoChecklist(items, catalog, stepId) {
       lines.push(`  - 证据要求：${meta3.evidence}`);
   }
   lines.push("");
-  lines.push("**提交申报示例**（`must_do_checks`，逐项对齐上方清单）：", "");
+  lines.push("**提交申报示例**（`must_do_checks`，逐项对齐上方清单，口径按必做项类型分三类）：", "");
   lines.push("```json");
   lines.push('"must_do_checks": [');
   const sample = items.slice(0, 2);
   sample.forEach((id, i) => {
     const sep = i === sample.length - 1 && items.length <= sample.length ? "" : ",";
-    lines.push(`  { "step": "${id}", "completed": true, "evidence": "<执行命令 + 结果摘要>" }${sep}`);
+    lines.push(`  { "step": "${id}", "completed": true, "evidence": "<按申报口径填写>" }${sep}`);
   });
   if (items.length > sample.length)
     lines.push("  …（其余必做项同上逐项申报）");
   lines.push("]");
   lines.push("```");
+  lines.push("");
+  lines.push("申报口径三类：①工具实跑申报——低成本必做项，evidence 填执行命令 + 结果摘要；" + "②核验申报——仅限 workflow 指令白名单限定的高成本必做项，evidence 填核验方式 + 抽验样本；" + "③人工核对申报——核对类必做项，evidence 填核对对象 + 结论记录。");
   lines.push("");
   lines.push(`无法执行的必做项置 \`completed=false\` 并附结构化 \`skip_reason\`（格式：\`${SKIP_REASON_FORMAT}\`）；` + `遗漏必做项或缺少证据/降级理由的 passed 提交会被门禁拒绝。`);
   if (stepId === "implement") {
@@ -42585,24 +42761,32 @@ async function resolveChangeDocContent(repoRoot, state, changeId, baseBranch, re
     const item = state.workItems.find((w) => w.id === `task:${state.taskGroupId}`);
     const worktreePath = item && typeof item.metadata["worktree_path"] === "string" ? item.metadata["worktree_path"] : null;
     if (worktreePath) {
-      const p = path5.join(worktreePath, relPath);
+      const p = path6.join(worktreePath, relPath);
       if (await pathExists(p)) {
         try {
-          return await readFile4(p, "utf-8");
+          return await readFile5(p, "utf-8");
         } catch {}
       }
     }
   }
-  const mainPath = path5.join(repoRoot, relPath);
+  const mainPath = path6.join(repoRoot, relPath);
   if (await pathExists(mainPath)) {
     try {
-      return await readFile4(mainPath, "utf-8");
+      return await readFile5(mainPath, "utf-8");
     } catch {}
   }
   const shown = await runGitChecked(repoRoot, ["show", `${baseBranch}:${relPath}`]);
   if (shown.success && shown.stdout.length > 0)
     return shown.stdout;
   return null;
+}
+async function runGitignoreGuard(ctx, opts) {
+  return ensureGeneratedDirsIgnored(ctx.worktree, opts);
+}
+function withGitignoreGuard(guardNote, body) {
+  return `${body}
+
+${guardNote}`;
 }
 async function initExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_init");
@@ -42621,14 +42805,18 @@ async function initExecute(params, ctx) {
   }
   assertValidRecovery(args.recovery);
   assertProjectStacks(args);
+  const guardNote = await runGitignoreGuard(ctx, {
+    baseBranch: args.review_scope?.scope_type === "pr" ? args.review_scope.head_ref ?? null : args.base_branch ?? null,
+    skipCommit: args.review_scope?.fix === "none"
+  });
   if (args.review_scope !== undefined) {
-    return initReviewSession(args, ctx);
+    return withGitignoreGuard(guardNote, await initReviewSession(args, ctx));
   }
   if (!args.change_id || !args.task_group_id) {
     if (args.change_id) {
       const existing = await readStateByChangeId(ctx.worktree, args.change_id);
       if (existing?.kind === "review") {
-        return initReviewRecovery(args, existing, ctx);
+        return withGitignoreGuard(guardNote, await initReviewRecovery(args, existing, ctx));
       }
     }
     throw new Error("初始化需要两种入口之一：change 会话传 change_id + task_group_id；独立审查会话传 review_scope（会话 id 由审查范围推导并在返回体回传）。两种入口互斥，不可同传或都不传。");
@@ -42839,7 +43027,7 @@ async function initExecute(params, ctx) {
 
 ⚠️ simple 模式无 review 子层（仅 quality_review 单层审查），recovery.review_layer 参数未生效。`);
   }
-  return parts.join("");
+  return withGitignoreGuard(guardNote, parts.join(""));
 }
 async function bindReviewWorktreeRefs(item, worktreePath, branch, state) {
   item.metadata["worktree_path"] = worktreePath;
@@ -42880,7 +43068,7 @@ async function ensureChangeBranch(repoRoot, branch, baseBranch) {
 async function listFilesRecursive(root, prefix = "") {
   let entries = [];
   try {
-    entries = await readdir(path5.join(root, prefix), { withFileTypes: true });
+    entries = await readdir(path6.join(root, prefix), { withFileTypes: true });
   } catch {
     return [];
   }
@@ -42895,7 +43083,7 @@ async function listFilesRecursive(root, prefix = "") {
   return files;
 }
 async function sha256OfFile(filePath) {
-  return createHash2("sha256").update(await readFile4(filePath)).digest("hex");
+  return createHash2("sha256").update(await readFile5(filePath)).digest("hex");
 }
 async function removeEmptyDirs(root) {
   let entries = [];
@@ -42906,7 +43094,7 @@ async function removeEmptyDirs(root) {
   }
   for (const entry of entries) {
     if (entry.isDirectory())
-      await removeEmptyDirs(path5.join(root, entry.name));
+      await removeEmptyDirs(path6.join(root, entry.name));
   }
   try {
     await rmdir(root);
@@ -42961,13 +43149,13 @@ async function isSamePlanDocsAsBase(repoRoot, baseBranch, changeDir, basePaths, 
   if (basePaths.length !== localFiles.length)
     return false;
   const baseSet = new Set(basePaths);
-  const sourceDir = path5.join(repoRoot, changeDir);
+  const sourceDir = path6.join(repoRoot, changeDir);
   for (const rel of localFiles) {
     const relPath = `${changeDir}/${rel}`;
     if (!baseSet.has(relPath))
       return false;
     const baseOid = await blobOidInRef(repoRoot, baseBranch, relPath);
-    const localOid = await hashObjectOfFile(repoRoot, path5.join(sourceDir, rel));
+    const localOid = await hashObjectOfFile(repoRoot, path6.join(sourceDir, rel));
     if (baseOid !== localOid)
       return false;
   }
@@ -42976,7 +43164,7 @@ async function isSamePlanDocsAsBase(repoRoot, baseBranch, changeDir, basePaths, 
 async function resolveCrossBranchPlan(repoRoot, state, currentBranch) {
   const changeDir = `openspec/changes/${state.changeId}`;
   const basePaths = await listTreePaths(repoRoot, state.baseBranch, changeDir);
-  const sourceDir = path5.join(repoRoot, changeDir);
+  const sourceDir = path6.join(repoRoot, changeDir);
   const localFiles = await pathExists(sourceDir) ? await listFilesRecursive(sourceDir) : [];
   if (basePaths.length > 0) {
     if (localFiles.length === 0)
@@ -43008,7 +43196,7 @@ async function resolveCrossBranchPlan(repoRoot, state, currentBranch) {
 async function resolveDetachedPlan(repoRoot, state) {
   const changeDir = `openspec/changes/${state.changeId}`;
   const basePaths = await listTreePaths(repoRoot, state.baseBranch, changeDir);
-  const sourceDir = path5.join(repoRoot, changeDir);
+  const sourceDir = path6.join(repoRoot, changeDir);
   const localFiles = await pathExists(sourceDir) ? await listFilesRecursive(sourceDir) : [];
   if (basePaths.length > 0) {
     return { sync: false, skipNote: planDetachedOnBaseNote(state.baseBranch, changeDir, localFiles.length) };
@@ -43025,7 +43213,7 @@ async function resolveDetachedPlan(repoRoot, state) {
 }
 async function syncChangePlanDocs(repoRoot, worktreePath, state) {
   const changeDir = `openspec/changes/${state.changeId}`;
-  const sourceDir = path5.join(repoRoot, changeDir);
+  const sourceDir = path6.join(repoRoot, changeDir);
   if (!await pathExists(sourceDir))
     return "";
   const files = await listFilesRecursive(sourceDir);
@@ -43037,10 +43225,10 @@ async function syncChangePlanDocs(repoRoot, worktreePath, state) {
   }
   const hashes = new Map;
   for (const rel of files) {
-    const src = path5.join(sourceDir, rel);
-    const dst = path5.join(worktreePath, changeDir, rel);
+    const src = path6.join(sourceDir, rel);
+    const dst = path6.join(worktreePath, changeDir, rel);
     hashes.set(rel, await sha256OfFile(src));
-    await mkdir(path5.dirname(dst), { recursive: true });
+    await mkdir(path6.dirname(dst), { recursive: true });
     await copyFile(src, dst);
   }
   const addResult = await runGitChecked(worktreePath, ["add", "--", changeDir]);
@@ -43078,7 +43266,7 @@ async function syncChangePlanDocs(repoRoot, worktreePath, state) {
   }
   const changed = [];
   for (const rel of files) {
-    const src = path5.join(sourceDir, rel);
+    const src = path6.join(sourceDir, rel);
     if (!await pathExists(src) || await sha256OfFile(src) !== hashes.get(rel))
       changed.push(rel);
   }
@@ -43088,7 +43276,7 @@ async function syncChangePlanDocs(repoRoot, worktreePath, state) {
   }
   for (const rel of files) {
     try {
-      await rm2(path5.join(sourceDir, rel), { force: true });
+      await rm2(path6.join(sourceDir, rel), { force: true });
     } catch (e) {
       throw new Error(`主仓库规划文档副本删除失败（${rel}）：${e instanceof Error ? e.message : String(e)}。
 ` + `worktree 已提交、内容安全，请人工删除主仓库副本：\`rm -rf '${sourceDir}'\`。`);
@@ -43150,6 +43338,21 @@ async function ensureChangeWorktree(repoRoot, state, item, branch, defaultPath, 
 }
 async function setWorktreeExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_set_worktree");
+  const stateFileExists = existsSync5(getStatePath(ctx.worktree, params.change_id)) || existsSync5(path6.join(getLegacyStateDir(ctx.worktree), `${params.change_id}.json`));
+  let preexisting = null;
+  try {
+    const raw = await readFile5(getStatePath(ctx.worktree, params.change_id), "utf-8");
+    const parsed = JSON.parse(raw);
+    preexisting = {
+      baseBranch: parsed["baseBranch"],
+      kind: parsed["kind"],
+      reviewScope: parsed["reviewScope"]
+    };
+  } catch {}
+  const guardNote = stateFileExists ? await ensureGeneratedDirsIgnored(ctx.worktree, {
+    baseBranch: typeof preexisting?.baseBranch === "string" ? preexisting.baseBranch : null,
+    skipCommit: preexisting?.kind === "review" && preexisting.reviewScope?.fix === "none"
+  }) : "";
   const state = await readStateByWorktree(ctx.worktree, params.change_id);
   if (!state)
     throw new Error("编排会话未初始化。请先调用 opx_orch_init。");
@@ -43176,7 +43379,7 @@ async function setWorktreeExecute(params, ctx) {
   if (params.worktree_path) {
     wtPath = assertPathWithin(repoRoot, params.worktree_path, "worktree_path");
   } else {
-    wtPath = isReview ? path5.join(repoRoot, ".worktree", state.changeId, "review") : path5.join(repoRoot, ".worktree", state.changeId, "ws");
+    wtPath = isReview ? path6.join(repoRoot, ".worktree", state.changeId, "review") : path6.join(repoRoot, ".worktree", state.changeId, "ws");
   }
   const currentBranch = isReview ? "" : (await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
   const detached = !isReview && (currentBranch === "" || currentBranch === "HEAD");
@@ -43186,22 +43389,23 @@ async function setWorktreeExecute(params, ctx) {
   if (detached) {
     const plan = await resolveDetachedPlan(repoRoot, state);
     if (plan.blocked)
-      return plan.blocked;
+      return withGitignoreGuard(guardNote, plan.blocked);
     planSkipNote = plan.skipNote ?? "";
   } else if (crossBranch) {
     const plan = await resolveCrossBranchPlan(repoRoot, state, currentBranch);
     if (plan.blocked)
-      return plan.blocked;
+      return withGitignoreGuard(guardNote, plan.blocked);
     planSync = plan.sync ?? false;
     planSkipNote = plan.skipNote ?? "";
   }
   if (!detached && !crossBranch) {
     const changeStatus = await runGit(repoRoot, ["status", "--porcelain", `openspec/changes/${state.changeId}/`]);
     if (changeStatus.trim().length > 0) {
-      const addResult = await runGitChecked(repoRoot, ["add", `openspec/changes/${state.changeId}/`]);
+      const changeDir = `openspec/changes/${state.changeId}/`;
+      const addResult = await runGitChecked(repoRoot, ["add", "--", changeDir]);
       if (!addResult.success)
         throw new Error(`change 目录 git add 失败：${addResult.stderr}`);
-      const commitResult = await runGitChecked(repoRoot, ["commit", "-m", "docs(openspec): auto-commit before worktree setup"]);
+      const commitResult = await runGitChecked(repoRoot, ["commit", "-m", "docs(openspec): auto-commit before worktree setup", "--only", "--", changeDir]);
       if (!commitResult.success)
         throw new Error(`change 目录 git commit 失败：${commitResult.stderr}`);
     }
@@ -43268,13 +43472,13 @@ async function setWorktreeExecute(params, ctx) {
   if (storedPath) {
     await writeContextToWorktree(storedPath, state.changeId, state.taskGroupId);
   }
-  return [
+  return withGitignoreGuard(guardNote, [
     `- **状态**: ${reused ? "复用已有 worktree" : "已创建 worktree"}`,
     `- **路径**: \`${item.metadata["worktree_path"]}\``,
     `- **分支**: \`${branch}\``,
     ...planNote ? ["", planNote] : []
   ].join(`
-`);
+`));
 }
 async function statusExecute(params, ctx) {
   const agent = ctx.agent;
@@ -43320,10 +43524,10 @@ async function statusExecute(params, ctx) {
   return renderWorkflowStatusView(item, workflow, rec, { agent, orchestrator: ctx.orchestrator, identityDeclared: ctx.identityDeclared }, { state, tg, mainPollution, toolChanges, exemptedHits, exemptionItems });
 }
 async function sweepEmptyWorktreeParents(repoRoot, removedDir, changeId) {
-  const repoRootAbs = path5.resolve(repoRoot);
-  const groupLevelDir = path5.join(repoRootAbs, ".worktree", changeId);
-  const worktreeLevelDir = path5.join(repoRootAbs, ".worktree");
-  if (path5.dirname(path5.resolve(removedDir)) === groupLevelDir) {
+  const repoRootAbs = path6.resolve(repoRoot);
+  const groupLevelDir = path6.join(repoRootAbs, ".worktree", changeId);
+  const worktreeLevelDir = path6.join(repoRootAbs, ".worktree");
+  if (path6.dirname(path6.resolve(removedDir)) === groupLevelDir) {
     try {
       await rmdir(groupLevelDir);
     } catch {}
@@ -44774,12 +44978,12 @@ var agentSubmitSchema = {
 var OPX_TOOL_SPECS = [
   {
     name: "opx_orch_init",
-    description: "初始化编排会话。project_stacks 与 project_frameworks 必传（change 入口与 review_scope 独立审查入口均需要）：声明项目形态栈与框架栈，每个值须命中当前 skill 索引中 skill frontmatter 声明的 stacks / frameworks 标签（动态校验，无硬编码值域），作为 skill 加载清单过滤与 step 必做清单分组的过滤基准，与 change_id 同生命周期持久化（recovery 恢复时同样必传）。传入变更 ID 和任务组 ID，工具自动解析 tasks.md 提取全部任务组并解析目标组子任务，同时自动从 clarify.md 解析当前任务组执行边界写入状态，缺失时按整个 worktree 处理。可通过 recovery 参数恢复到指定阶段。无 recovery 重复初始化当前任务组时保留其阶段和进度；切换到其它任务组时初始化该组。可选 mode 参数（full/simple，缺省 simple）选择流程模式：full=完整流程（implement→三重审查+收尾验证，analyze 仅作 implement 上报 blocker 后的裁决回退落点）；simple=精简流程（implement→quality_review→done，不走 blocker 状态机）。首次新建状态时固化；已开始的变更仅切组（其他任务组均已完成或从未激活）或 recovery.phase=task_analysis 重制当前组（其他任务组同样须已完成或从未激活）时可更新，其余场景传不同 mode 报错。",
+    description: "编排前自动确保目标项目根 .gitignore 明确覆盖插件生成的目录并原子提交（缺条目只追加补齐、以仅含 .gitignore 一处变更的独立 commit 提交；无法安全提交时只写工作树使其生效）。初始化编排会话。project_stacks 与 project_frameworks 必传（change 入口与 review_scope 独立审查入口均需要）：声明项目形态栈与框架栈，每个值须命中当前 skill 索引中 skill frontmatter 声明的 stacks / frameworks 标签（动态校验，无硬编码值域），作为 skill 加载清单过滤与 step 必做清单分组的过滤基准，与 change_id 同生命周期持久化（recovery 恢复时同样必传）。传入变更 ID 和任务组 ID，工具自动解析 tasks.md 提取全部任务组并解析目标组子任务，同时自动从 clarify.md 解析当前任务组执行边界写入状态，缺失时按整个 worktree 处理。可通过 recovery 参数恢复到指定阶段。无 recovery 重复初始化当前任务组时保留其阶段和进度；切换到其它任务组时初始化该组。可选 mode 参数（full/simple，缺省 simple）选择流程模式：full=完整流程（implement→三重审查+收尾验证，analyze 仅作 implement 上报 blocker 后的裁决回退落点）；simple=精简流程（implement→quality_review→done，不走 blocker 状态机）。首次新建状态时固化；已开始的变更仅切组（其他任务组均已完成或从未激活）或 recovery.phase=task_analysis 重制当前组（其他任务组同样须已完成或从未激活）时可更新，其余场景传不同 mode 报错。",
     schema: orchInitSchema
   },
   {
     name: "opx_orch_set_worktree",
-    description: "确保目标组的 git worktree 就绪。change 会话按 change 模型 create-or-reuse：分支 change/{changeId} 不存在时从基准分支 tip 创建，worktree 常驻于 .worktree/{changeId}/ws，全部任务组串行复用（复用校验：目录缺失自愈重建、openspec 文档脏自动提交、代码文件脏拒绝）。只补齐资源，不改变阶段。",
+    description: "编排前自动确保目标项目根 .gitignore 明确覆盖插件生成的目录并原子提交（缺条目只追加补齐、以仅含 .gitignore 一处变更的独立 commit 提交；无法安全提交时只写工作树使其生效）。确保目标组的 git worktree 就绪。change 会话按 change 模型 create-or-reuse：分支 change/{changeId} 不存在时从基准分支 tip 创建，worktree 常驻于 .worktree/{changeId}/ws，全部任务组串行复用（复用校验：目录缺失自愈重建、openspec 文档脏自动提交、代码文件脏拒绝）。只补齐资源，不改变阶段。",
     schema: setWorktreeSchema
   },
   {
@@ -44845,7 +45049,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "1.5.3";
+var PKG_VERSION = "1.6.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
