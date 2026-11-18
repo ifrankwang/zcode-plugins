@@ -35001,10 +35001,10 @@ var EMPTY_COMPLETION_RESULT = {
 };
 
 // src/core/tools/lifecycle.ts
-import path6 from "path";
+import path5 from "path";
 import { createHash as createHash2 } from "node:crypto";
-import { copyFile, mkdir, readdir, readFile as readFile5, rmdir, rm as rm2 } from "node:fs/promises";
-import { existsSync as existsSync5 } from "node:fs";
+import { copyFile, mkdir, readdir, readFile as readFile6, rmdir, rm as rm2 } from "node:fs/promises";
+import { existsSync as existsSync9 } from "node:fs";
 
 // src/core/types.ts
 var CODE_DIMENSIONS = ["style", "architecture", "performance", "security", "maintainability"];
@@ -36600,6 +36600,10 @@ function buildIssueWorkItem(issue2) {
   child.metadata["dimension"] = issue2.dimension;
   child.metadata["file"] = issue2.file;
   child.metadata["line"] = issue2.line;
+  if (issue2.pathPattern !== undefined)
+    child.metadata["path_pattern"] = issue2.pathPattern;
+  if (issue2.ruleKeys !== undefined && issue2.ruleKeys.length > 0)
+    child.metadata["rule_keys"] = issue2.ruleKeys;
   if (issue2.status === "exemption_requested") {
     child.metadata[EXEMPT_REQUEST_KEY] = {
       requestedBy: reporterAgent,
@@ -36752,162 +36756,959 @@ function releaseLock(lockPath) {
 }
 
 // src/core/gitignore.ts
-import path3 from "node:path";
 import { readFile as readFile3, writeFile as writeFile3 } from "node:fs/promises";
-var GENERATED_DIR_ENTRIES = [".worktree/", "openspec/states/"];
-var GITIGNORE_REL = ".gitignore";
-var COMMIT_MESSAGE = "chore(gitignore): ignore openspec orchestration artifacts";
-function normalizeEntry(line) {
-  return line.trim().replace(/\/+$/, "");
+import { join as join3 } from "node:path";
+
+// src/core/ignore-baseline.ts
+import { existsSync as existsSync4, readdirSync as readdirSync4, readFileSync as readFileSync3 } from "node:fs";
+import { dirname as dirname2, join as join2, resolve as resolve3 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+
+// src/skills/scan.ts
+import { existsSync as existsSync2, readdirSync as readdirSync2 } from "node:fs";
+import { resolve, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
+var projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+function resolveSkillScanRoot(moduleUrl) {
+  const startDir = dirname(fileURLToPath(moduleUrl));
+  let dir = startDir;
+  for (;; ) {
+    for (const candidate of [resolve(dir, "assets", "skills"), resolve(dir, "skills")]) {
+      if (isSkillRoot(candidate))
+        return candidate;
+    }
+    const parent = dirname(dir);
+    if (parent === dir)
+      break;
+    dir = parent;
+  }
+  return null;
 }
-function explicitlyCovered(content) {
-  const wanted = new Set(GENERATED_DIR_ENTRIES.map(normalizeEntry));
+function isSkillRoot(candidate) {
+  if (!existsSync2(candidate))
+    return false;
+  try {
+    return readdirSync2(candidate, { withFileTypes: true }).some((entry) => entry.isDirectory() && existsSync2(join(candidate, entry.name, "SKILL.md")));
+  } catch {
+    return false;
+  }
+}
+var scanRoot = resolveSkillScanRoot(import.meta.url);
+var REPO_SKILL_SCAN_ROOTS = [
+  ...scanRoot ? [scanRoot] : [],
+  resolve(projectRoot, ".agents", "skills"),
+  resolve(projectRoot, ".opencode", "skills")
+];
+var SKILL_SCAN_ROOTS = [
+  ...REPO_SKILL_SCAN_ROOTS,
+  join(homedir(), ".agents", "skills"),
+  join(homedir(), ".config", "opencode", "skills")
+];
+var rootsOverride = null;
+function effectiveSkillScanRoots() {
+  return rootsOverride ?? SKILL_SCAN_ROOTS;
+}
+function findSkillPath(name) {
+  for (const root of effectiveSkillScanRoots()) {
+    const p = resolve(root, name, "SKILL.md");
+    if (existsSync2(p))
+      return p;
+  }
+  return null;
+}
+
+// src/skills/resolve.ts
+import { readdirSync as readdirSync3, readFileSync as readFileSync2, existsSync as existsSync3 } from "node:fs";
+import { resolve as resolve2 } from "node:path";
+
+// src/skills/stacks.ts
+function matchesSessionStacks(stacks, frameworks, session) {
+  if (stacks.length > 0 && !stacks.some((t) => session.project_stacks.includes(t)))
+    return false;
+  if (frameworks.length > 0 && !frameworks.some((t) => session.project_frameworks.includes(t)))
+    return false;
+  return true;
+}
+function matchesSessionShapes(stacks, session) {
+  if (stacks.length === 0)
+    return true;
+  return stacks.some((t) => session.project_stacks.includes(t));
+}
+function frameworkShapes(index = scanSkillTags()) {
+  const map3 = new Map;
+  for (const [skill, frameworks] of index.skillFrameworks) {
+    const stacks = index.skillStacks.get(skill) ?? [];
+    if (stacks.length === 0)
+      continue;
+    for (const framework of frameworks) {
+      const shapes = map3.get(framework) ?? new Set;
+      for (const shape of stacks)
+        shapes.add(shape);
+      map3.set(framework, shapes);
+    }
+  }
+  return map3;
+}
+function conflictingFrameworks(session, index = scanSkillTags()) {
+  const map3 = frameworkShapes(index);
+  const conflicts = [];
+  for (const framework of session.project_frameworks) {
+    const shapes = map3.get(framework);
+    if (!shapes || shapes.size === 0)
+      continue;
+    const shapeList = [...shapes].sort();
+    if (shapeList.some((s) => session.project_stacks.includes(s)))
+      continue;
+    conflicts.push({ framework, shapes: shapeList });
+  }
+  return conflicts;
+}
+function uncoveredShapes(session, index = scanSkillTags()) {
+  const uncovered = [];
+  for (const shape of session.project_stacks) {
+    const covered = [...index.skillStacks.entries()].some(([skill, stacks]) => {
+      if (!stacks.includes(shape))
+        return false;
+      return (index.skillFrameworks.get(skill) ?? []).some((f) => session.project_frameworks.includes(f));
+    });
+    if (!covered)
+      uncovered.push({ shape, declaredFrameworks: [...session.project_frameworks] });
+  }
+  return uncovered;
+}
+function shapeCoverageWarnings(session, index = scanSkillTags()) {
+  return uncoveredShapes(session, index).map(({ shape, declaredFrameworks }) => {
+    const declared = declaredFrameworks.map((f) => `\`${f}\``).join("、");
+    return `形态 \`${shape}\` 已声明，但没有与之匹配的框架声明（当前声明框架：${declared}）；` + `该形态的技术栈配套 skill 与必做项可能未被覆盖`;
+  });
+}
+var knownTagsOverride = null;
+function knownStacks(index = scanSkillTags()) {
+  if (knownTagsOverride)
+    return new Set(knownTagsOverride.stacks);
+  const tags = new Set;
+  for (const list of index.skillStacks.values())
+    for (const tag of list)
+      tags.add(tag);
+  return tags;
+}
+function knownFrameworks(index = scanSkillTags()) {
+  if (knownTagsOverride)
+    return new Set(knownTagsOverride.frameworks);
+  const tags = new Set;
+  for (const list of index.skillFrameworks.values())
+    for (const tag of list)
+      tags.add(tag);
+  return tags;
+}
+
+// src/skills/resolve.ts
+var cacheKey = null;
+var cacheIndex = null;
+function parseFrontmatterList(raw, field) {
+  const m = raw.match(new RegExp(`${field}:\\s*\\[([^\\]]*)\\]`));
+  if (!m)
+    return null;
+  return m[1].split(",").map((s) => s.trim().replace(/["']/g, "")).filter(Boolean);
+}
+function scanSkillTags(roots = effectiveSkillScanRoots()) {
+  const key = roots.join("\x00");
+  if (cacheKey === key && cacheIndex)
+    return cacheIndex;
+  const tagMap = new Map;
+  const skillTags = new Map;
+  const skillStacks = new Map;
+  const skillFrameworks = new Map;
+  const seen = new Set;
+  for (const root of roots) {
+    if (!existsSync3(root))
+      continue;
+    for (const entry of readdirSync3(root, { withFileTypes: true })) {
+      if (!entry.isDirectory())
+        continue;
+      if (seen.has(entry.name))
+        continue;
+      const mdPath = resolve2(root, entry.name, "SKILL.md");
+      if (!existsSync3(mdPath))
+        continue;
+      try {
+        const raw = readFileSync2(mdPath, "utf-8");
+        const tags = parseFrontmatterList(raw, "capabilities");
+        if (!tags)
+          continue;
+        skillTags.set(entry.name, tags);
+        for (const tag of tags) {
+          const arr = tagMap.get(tag) || [];
+          arr.push(entry.name);
+          tagMap.set(tag, arr);
+        }
+        const stacks = parseFrontmatterList(raw, "stacks");
+        if (stacks && stacks.length > 0)
+          skillStacks.set(entry.name, stacks);
+        const frameworks = parseFrontmatterList(raw, "frameworks");
+        if (frameworks && frameworks.length > 0)
+          skillFrameworks.set(entry.name, frameworks);
+        seen.add(entry.name);
+      } catch {}
+    }
+  }
+  cacheKey = key;
+  cacheIndex = { tagMap, skillTags, skillStacks, skillFrameworks };
+  return cacheIndex;
+}
+function resolveSkillsForCapabilities(caps, session, index) {
+  if (!caps || caps.length === 0)
+    return { skillNames: [] };
+  const idx = index ?? scanSkillTags();
+  const { tagMap, skillStacks, skillFrameworks } = idx;
+  const matched = new Set;
+  for (const cap of caps) {
+    for (const n of tagMap.get(cap) || [])
+      matched.add(n);
+  }
+  const skillNames = [];
+  for (const name of matched) {
+    const declaredStacks = skillStacks.get(name) ?? [];
+    const declaredFrameworks = skillFrameworks.get(name) ?? [];
+    if (session === null) {
+      if (declaredStacks.length > 0 || declaredFrameworks.length > 0)
+        continue;
+    } else if (session && !matchesSessionStacks(declaredStacks, declaredFrameworks, session))
+      continue;
+    skillNames.push(name);
+  }
+  return { skillNames };
+}
+
+// src/core/ignore-baseline.ts
+var IGNORE_BASELINE_DIR_NAME = "ignore-baseline";
+var moduleRoot = resolve3(dirname2(fileURLToPath2(import.meta.url)), "..", "..");
+function resolveIgnoreBaselineRoot(moduleUrl = import.meta.url) {
+  const startDir = dirname2(fileURLToPath2(moduleUrl));
+  let dir = startDir;
+  for (;; ) {
+    for (const candidate of [
+      resolve3(dir, "assets", IGNORE_BASELINE_DIR_NAME),
+      resolve3(dir, IGNORE_BASELINE_DIR_NAME)
+    ]) {
+      if (existsSync4(join2(candidate, ".gitignore")))
+        return candidate;
+    }
+    const parent = dirname2(dir);
+    if (parent === dir)
+      break;
+    dir = parent;
+  }
+  const repoCandidate = join2(moduleRoot, "assets", IGNORE_BASELINE_DIR_NAME);
+  return existsSync4(join2(repoCandidate, ".gitignore")) ? repoCandidate : null;
+}
+function parseIgnoreAsset(content) {
+  return content.replace(/^\uFEFF/, "").split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("#"));
+}
+function normalizeIgnoreLine(line) {
+  const trimmed = line.trim();
+  const negated = trimmed.startsWith("!");
+  const body = (negated ? trimmed.slice(1) : trimmed).replace(/\/+$/, "");
+  return `${negated ? "!" : ""}${body}`;
+}
+function readAssetLines(file2) {
+  try {
+    return parseIgnoreAsset(readFileSync3(file2, "utf-8"));
+  } catch {
+    return [];
+  }
+}
+function listAssetFiles(dir) {
+  if (!existsSync4(dir))
+    return [];
+  try {
+    return readdirSync4(dir, { withFileTypes: true }).filter((entry) => entry.isFile()).map((entry) => entry.name).sort();
+  } catch {
+    return [];
+  }
+}
+function collectIgnoreBaseline(session, opts = {}) {
+  const groups = new Map;
+  const seenByTarget = new Map;
+  const add = (target, line, source) => {
+    const key = normalizeIgnoreLine(line);
+    if (key.length === 0)
+      return;
+    const seen = seenByTarget.get(target) ?? new Set;
+    if (seen.has(key))
+      return;
+    seen.add(key);
+    seenByTarget.set(target, seen);
+    const entries = groups.get(target) ?? [];
+    entries.push({ line, source });
+    groups.set(target, entries);
+  };
+  const baselineRoot = opts.baselineRoot === undefined ? resolveIgnoreBaselineRoot() : opts.baselineRoot;
+  if (baselineRoot) {
+    for (const name of listAssetFiles(baselineRoot)) {
+      for (const line of readAssetLines(join2(baselineRoot, name)))
+        add(name, line, "框架通用基线");
+    }
+  }
+  if (session) {
+    const index = opts.index ?? scanSkillTags();
+    for (const skill of index.skillTags.keys()) {
+      const stacks = index.skillStacks.get(skill) ?? [];
+      if (!matchesSessionShapes(stacks, session))
+        continue;
+      const skillMd = findSkillPath(skill);
+      if (!skillMd)
+        continue;
+      const ignoreDir = join2(dirname2(skillMd), "ignore");
+      const source = `skill \`${skill}\``;
+      for (const name of listAssetFiles(ignoreDir)) {
+        for (const line of readAssetLines(join2(ignoreDir, name)))
+          add(name, line, source);
+      }
+    }
+  }
+  return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([target, entries]) => ({ target, entries }));
+}
+
+// src/core/gitignore.ts
+var GENERATED_DIR_ENTRIES = [".worktree/", "openspec/states/"];
+var COMMIT_MESSAGE = "chore(ignore): add project ignore baseline";
+function normalizeEntry(line) {
+  return normalizeIgnoreLine(line);
+}
+function analyzeCoverage(content) {
   const covered = new Set;
   const negated = new Set;
-  for (const raw of content.split(/\r?\n/)) {
+  for (const raw of (content ?? "").split(/\r?\n/)) {
     const line = raw.trim();
-    if (line === "" || line.startsWith("#"))
+    if (line.length === 0 || line.startsWith("#"))
       continue;
-    const isNegation = line.startsWith("!");
-    const normalized = normalizeEntry(isNegation ? line.slice(1) : line);
-    if (!wanted.has(normalized))
+    if (line.startsWith("!")) {
+      const body = normalizeEntry(line.slice(1));
+      negated.add(body);
+      covered.delete(body);
       continue;
-    if (isNegation)
-      negated.add(normalized);
-    else
-      covered.add(normalized);
+    }
+    covered.add(normalizeEntry(line));
   }
-  for (const n of negated)
-    covered.delete(n);
-  return covered;
+  return { covered, negated };
+}
+function planTarget(target, baseline, existsBefore, before, statusRaw) {
+  const { covered, negated } = analyzeCoverage(before);
+  const missing = [];
+  const sources = [];
+  const preserved = [];
+  const preservedByNegation = [];
+  const seen = new Set;
+  const negatedBodies = [...negated];
+  const push = (line, source) => {
+    const key = normalizeEntry(line);
+    if (key.length === 0 || seen.has(key) || covered.has(key))
+      return;
+    seen.add(key);
+    missing.push(line);
+    if (source && !sources.includes(source))
+      sources.push(source);
+  };
+  if (target === ".gitignore") {
+    for (const entry of GENERATED_DIR_ENTRIES)
+      push(entry);
+  }
+  for (const { line, source } of baseline) {
+    const key = normalizeEntry(line);
+    if (seen.has(key) || covered.has(key))
+      continue;
+    if (negated.has(key)) {
+      if (!preserved.includes(line))
+        preserved.push(line);
+      continue;
+    }
+    const childNegation = key.length > 0 ? negatedBodies.find((body) => body.startsWith(`${key}/`)) : undefined;
+    if (childNegation) {
+      const negation = `!${childNegation}`;
+      if (!preservedByNegation.some((p) => p.entry === line && p.negation === negation)) {
+        preservedByNegation.push({ entry: line, negation });
+      }
+      continue;
+    }
+    push(line, source);
+  }
+  const lines = statusRaw.split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l.length > 0);
+  const untrackedOnly = lines.length === 1 && lines[0] === `?? ${target}`;
+  const clean = lines.length === 0;
+  return {
+    target,
+    existsBefore,
+    before,
+    missing,
+    sources,
+    preserved,
+    preservedByNegation,
+    statusRaw,
+    untrackedOnly,
+    userDirty: !clean && !untrackedOnly
+  };
+}
+function appendMissing(before, missing) {
+  if (missing.length === 0)
+    return before ?? "";
+  const eol = before && before.includes(`\r
+`) ? `\r
+` : `
+`;
+  const base = before ?? "";
+  const prefix = base.length > 0 && !base.endsWith(`
+`) ? eol : "";
+  return `${base}${prefix}${missing.join(eol)}${eol}`;
 }
 async function probeIgnoreSources(repoRoot) {
   const notes = [];
   for (const entry of GENERATED_DIR_ENTRIES) {
     const out = await runGit(repoRoot, ["check-ignore", "-v", "--", entry]);
-    const firstLine = out.split(`
-`)[0]?.trim() ?? "";
-    const source = firstLine ? firstLine.split(":")[0] : "";
-    notes.push(source === GITIGNORE_REL ? `\`${entry}\` 命中来源 \`${GITIGNORE_REL}\`` : `\`${entry}\` 未确认命中来源`);
+    if (!out) {
+      notes.push(`\`${entry}\` 未确认命中来源`);
+      continue;
+    }
+    const source = out.split(/\r?\n/)[0]?.split("\t")[0]?.split(":").slice(0, -2).join(":") ?? "";
+    const fileName = source.split(/[\\/]/).pop() ?? source;
+    notes.push(fileName === ".gitignore" ? `\`${entry}\` 命中来源 \`.gitignore\`` : `\`${entry}\` 未确认命中来源`);
   }
   return notes;
 }
-function appendMissing(before, missing) {
-  if (missing.length === 0)
-    return before ?? "";
-  if (before === null || before.trim() === "")
-    return `${missing.join(`
-`)}
-`;
-  const eol = before.includes(`\r
-`) ? `\r
-` : `
-`;
-  const hasTrailingNewline = /\r?\n$/.test(before);
-  const head = hasTrailingNewline ? before : `${before}${eol}`;
-  return `${head}${missing.join(eol)}${eol}`;
-}
-async function precheckCommit(repoRoot, opts, beforeExists) {
-  if (opts.skipCommit) {
-    return { allowed: false, reason: "当前会话为只审不修的独立审查会话，跳过版本库提交", willBeUntracked: false };
-  }
-  const currentBranch = (await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
-  if (currentBranch === "" || currentBranch === "HEAD") {
-    return { allowed: false, reason: "当前处于 detached HEAD，无法确认提交目标分支", willBeUntracked: false };
-  }
-  const effectiveBase = opts.baseBranch ?? currentBranch;
-  if (currentBranch !== effectiveBase) {
-    return {
-      allowed: false,
-      reason: `当前检出分支 \`${currentBranch}\` 与基准分支 \`${effectiveBase}\` 不同`,
-      willBeUntracked: false
-    };
-  }
-  const statusOut = await runGit(repoRoot, ["status", "--porcelain", "--", GITIGNORE_REL]);
-  const entries = statusOut.split(`
-`).map((l) => l.trim()).filter(Boolean);
-  const untrackedOnly = entries.length === 1 && /^\?\?\s+\.gitignore$/.test(entries[0]);
-  let willBeUntracked = false;
-  let userDirty = false;
-  if (!beforeExists) {
-    willBeUntracked = entries.length === 0;
-    userDirty = entries.length > 0;
-  } else if (entries.length === 0) {
-    willBeUntracked = false;
-  } else if (untrackedOnly) {
-    willBeUntracked = true;
-  } else {
-    userDirty = true;
-  }
-  if (userDirty) {
-    return {
-      allowed: false,
-      reason: `\`${GITIGNORE_REL}\` 存在用户其它未提交改动，提交会夹带非本次内容`,
-      willBeUntracked: false
-    };
-  }
-  const stagedOutside = await listStagedPathsOutside(repoRoot, [GITIGNORE_REL]);
-  if (stagedOutside.length > 0) {
-    return {
-      allowed: false,
-      reason: "主仓库暂存区含其它已暂存改动，提交会夹带非本次内容",
-      willBeUntracked: false
-    };
-  }
-  return { allowed: true, reason: "", willBeUntracked };
-}
-async function ensureGeneratedDirsIgnored(repoRoot, opts = {}) {
-  const gitignorePath = path3.join(repoRoot, GITIGNORE_REL);
-  let before = null;
+async function readTarget(repoRoot, target) {
   try {
-    before = await readFile3(gitignorePath, "utf-8");
+    return await readFile3(join3(repoRoot, target), "utf-8");
   } catch {
-    before = null;
+    return null;
   }
-  const beforeExists = before !== null;
-  const covered = explicitlyCovered(before ?? "");
-  const probeNotes = await probeIgnoreSources(repoRoot);
-  const missing = GENERATED_DIR_ENTRIES.filter((e) => !covered.has(normalizeEntry(e)));
-  const precheck = await precheckCommit(repoRoot, opts, beforeExists);
-  const needCommit = missing.length > 0 || precheck.willBeUntracked;
-  if (missing.length > 0) {
-    await writeFile3(gitignorePath, appendMissing(before, missing), "utf-8");
+}
+async function precheckCommit(repoRoot, opts, targets) {
+  if (opts.skipCommit)
+    return "当前会话为只审不修的独立审查会话，跳过版本库提交";
+  const branch = await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  if (!branch || branch === "HEAD")
+    return "当前处于 detached HEAD，无法确认提交目标分支";
+  const base = opts.baseBranch ?? null;
+  if (base && branch !== base)
+    return `当前检出分支 \`${branch}\` 与基准分支 \`${base}\` 不同`;
+  const stagedOutside = await listStagedPathsOutside(repoRoot, [...targets]);
+  if (stagedOutside.length > 0)
+    return "主仓库暂存区含其它已暂存改动，提交会夹带非本次内容";
+  return null;
+}
+function renderBaselineLines(plans, hasPrettierBaseline, baselineMissing) {
+  const lines = [];
+  if (baselineMissing) {
+    lines.push("- **忽略基线**: 基线资产缺失，本次只补编排产物条目。");
   }
-  const addedNote = missing.length > 0 ? `本次补齐：${missing.map((e) => `\`${e}\``).join("、")}` : "条目齐全，未改动文件";
-  const lines = [
-    `- **生成目录忽略**: 已写入并生效（${addedNote}）。`,
-    `- **辅助校验**: ${probeNotes.join("；")}。`
-  ];
-  if (!precheck.allowed || !needCommit) {
-    const reason = !precheck.allowed ? precheck.reason : "条目已纳入版本库，无变更需要提交";
-    lines.push(`- **版本库提交**: 未提交（原因：${reason}）；已生效、未提交。`);
+  for (const plan of plans) {
+    if (plan.missing.length === 0) {
+      lines.push(`- **忽略基线**: \`${plan.target}\` 已齐全，未改动文件。`);
+      continue;
+    }
+    const action = plan.existsBefore ? "补齐" : "新建";
+    const entries = plan.missing.map((e) => `\`${e}\``).join("、");
+    lines.push(`- **忽略基线**: \`${plan.target}\` ${action} ${plan.missing.length} 条（${entries}）。`);
+    if (plan.sources.length > 0) {
+      lines.push(`- **基线来源**: \`${plan.target}\` ← ${plan.sources.join("、")}。`);
+    }
+  }
+  for (const plan of plans) {
+    if (plan.preserved.length === 0)
+      continue;
+    const entries = plan.preserved.map((e) => `\`!${e}\``).join("、");
+    lines.push(`- **用户显式保留**: \`${plan.target}\` 中的 ${entries} 未追加（用户已显式保留）。`);
+  }
+  for (const plan of plans) {
+    for (const item of plan.preservedByNegation) {
+      lines.push(`- **用户显式保留**: \`${plan.target}\` 已保留你的 \`${item.negation}\`，故未追加 \`${item.entry}\`。`);
+    }
+  }
+  if (!hasPrettierBaseline) {
+    lines.push("- **`.prettierignore` 基线**: 当前声明的形态没有 `.prettierignore` 基线，未创建该文件。");
+  }
+  return lines;
+}
+function renderCommitLine(commitTargets, reasons) {
+  if (commitTargets.length === 0)
+    return null;
+  const list = commitTargets.map((t) => `\`${t}\``).join("、");
+  if (reasons.length > 0) {
+    return `- **版本库提交**: 未提交（原因：${reasons.join("；")}）；本次改动只写工作树，未进版本库。`;
+  }
+  return null;
+}
+async function ensureIgnoreBaseline(repoRoot, opts = {}) {
+  const baselineRoot = opts.baselineRoot === undefined ? resolveIgnoreBaselineRoot() : opts.baselineRoot;
+  const baseline = collectIgnoreBaseline(opts.session ?? null, { baselineRoot });
+  const baselineByTarget = new Map(baseline.map((b) => [b.target, b.entries]));
+  const targets = [...new Set([".gitignore", ...baseline.map((b) => b.target)])].sort((a, b) => a.localeCompare(b));
+  const plans = [];
+  for (const target of targets) {
+    const before = await readTarget(repoRoot, target);
+    const statusRaw = await runGit(repoRoot, ["status", "--porcelain", "--", target]);
+    plans.push(planTarget(target, baselineByTarget.get(target) ?? [], before !== null, before, statusRaw));
+  }
+  const globalReason = await precheckCommit(repoRoot, opts, targets);
+  const dirtyReasons = plans.filter((p) => p.userDirty).map((p) => `\`${p.target}\` 存在用户其它未提交改动，提交会夹带非本次内容`);
+  const reasons = globalReason ? [globalReason] : [];
+  reasons.push(...dirtyReasons);
+  for (const plan of plans) {
+    if (plan.missing.length === 0)
+      continue;
+    await writeFile3(join3(repoRoot, plan.target), appendMissing(plan.before, plan.missing), "utf-8");
+  }
+  const commitTargets = plans.filter((p) => p.missing.length > 0 || p.untrackedOnly).map((p) => p.target);
+  const lines = renderBaselineLines(plans, baseline.some((b) => b.target === ".prettierignore"), baselineRoot === null);
+  const probe = await probeIgnoreSources(repoRoot);
+  if (probe.length > 0)
+    lines.push(`- **辅助校验**: ${probe.join("；")}。`);
+  if (commitTargets.length === 0)
+    return lines.join(`
+`);
+  const blocked = renderCommitLine(commitTargets, reasons);
+  if (blocked) {
+    lines.push(blocked);
     return lines.join(`
 `);
   }
-  if (precheck.willBeUntracked) {
-    const addRes = await runGitChecked(repoRoot, ["add", "-N", "--", GITIGNORE_REL]);
-    if (!addRes.success) {
-      lines.push(`- **版本库提交**: 未提交（原因：\`git add -N\` 失败：${addRes.stderr}）；已生效、未提交。`);
+  const staged = await runGit(repoRoot, ["diff", "--cached", "--name-only"]);
+  if (staged) {
+    lines.push(renderCommitLine(commitTargets, ["主仓库暂存区含其它已暂存改动，提交会夹带非本次内容"]));
+    return lines.join(`
+`);
+  }
+  const needsIntentToAdd = [];
+  for (const target of commitTargets) {
+    const status = await runGit(repoRoot, ["status", "--porcelain", "--", target]);
+    const statusLines = status.split(/\r?\n/).map((l) => l.trimEnd()).filter(Boolean);
+    if (statusLines.length === 0)
+      continue;
+    if (statusLines.length === 1 && statusLines[0] === `?? ${target}`) {
+      needsIntentToAdd.push(target);
+      continue;
+    }
+    if (statusLines.length === 1 && statusLines[0] === ` M ${target}`)
+      continue;
+    lines.push(renderCommitLine(commitTargets, [
+      `\`${target}\` 在写入后出现预期外状态（${statusLines.join(" / ")}），提交会夹带非本次内容`
+    ]));
+    return lines.join(`
+`);
+  }
+  const added = [];
+  for (const target of needsIntentToAdd) {
+    const res = await runGitChecked(repoRoot, ["add", "-N", "--", target]);
+    if (!res.success) {
+      await rollbackIntentToAdd(repoRoot, added);
+      lines.push(renderCommitLine(commitTargets, [`\`git add -N\` 失败（${res.stderr || "未知错误"}）`]));
       return lines.join(`
 `);
     }
+    added.push(target);
   }
-  const commitRes = await runGitChecked(repoRoot, ["commit", "-m", COMMIT_MESSAGE, "--only", "--", GITIGNORE_REL]);
-  if (!commitRes.success) {
-    lines.push(`- **版本库提交**: 未提交（原因：\`git commit --only\` 失败：${commitRes.stderr}）；已生效、未提交。`);
+  const commit = await runGitChecked(repoRoot, [
+    "commit",
+    "-m",
+    COMMIT_MESSAGE,
+    "--only",
+    "--",
+    ...commitTargets
+  ]);
+  if (!commit.success) {
+    await rollbackIntentToAdd(repoRoot, added);
+    lines.push(renderCommitLine(commitTargets, [`\`git commit --only\` 失败（${commit.stderr || "未知错误"}）`]));
     return lines.join(`
 `);
   }
-  const oid = (await runGit(repoRoot, ["rev-parse", "--verify", "HEAD"])).trim();
-  lines.push(`- **版本库提交**: 已原子提交，仅含 \`${GITIGNORE_REL}\` 一处变更（commit \`${oid}\`，消息 \`${COMMIT_MESSAGE}\`）。`);
+  const oid = await runGit(repoRoot, ["rev-parse", "--verify", "HEAD"]);
+  const list = commitTargets.map((t) => `\`${t}\``).join("、");
+  lines.push(`- **版本库提交**: 已提交，仅含 ${list}（commit \`${oid}\`，消息 \`${COMMIT_MESSAGE}\`）。`);
+  const shown = (await runGit(repoRoot, ["show", "--name-only", "--format=", "HEAD"])).split(/\r?\n/).map((l) => l.trim()).filter(Boolean).sort();
+  const expected = [...commitTargets].sort();
+  if (shown.join(`
+`) !== expected.join(`
+`)) {
+    lines.push(`- **提交核验**: 提交内容与预期不一致（实际：${shown.join("、") || "无"}；预期：${expected.join("、")}），请人工核对。`);
+  }
   return lines.join(`
+`);
+}
+async function rollbackIntentToAdd(repoRoot, files) {
+  if (files.length === 0)
+    return;
+  await runGitChecked(repoRoot, ["reset", "--", ...files]);
+}
+
+// src/core/containers.ts
+import { execFile as execFile2 } from "node:child_process";
+import { existsSync as existsSync5, readdirSync as readdirSync5, readFileSync as readFileSync4 } from "node:fs";
+import { join as join4 } from "node:path";
+var PROBE_TIMEOUT_MS = 2000;
+var PS_ARGS = ["ps", "--format", "{{.Image}}\t{{.Names}}\t{{.Ports}}"];
+var EMPTY_RESULT = {
+  runtime: null,
+  containers: [],
+  composeHits: [],
+  source: "none"
+};
+function createDefaultRunner() {
+  return {
+    run(cmd, args) {
+      return new Promise((resolve4) => {
+        execFile2(cmd, args, { timeout: PROBE_TIMEOUT_MS, maxBuffer: 1024 * 1024 }, (error62, stdout, stderr) => {
+          const out = typeof stdout === "string" ? stdout : String(stdout ?? "");
+          const err = typeof stderr === "string" ? stderr : String(stderr ?? "");
+          if (!error62) {
+            resolve4({ stdout: out, stderr: err, exitCode: 0 });
+            return;
+          }
+          const e = error62;
+          const timedOut = e.killed === true || e.code === "ETIMEDOUT" || e.signal === "SIGTERM";
+          const code = typeof e.code === "number" ? e.code : e.code === "ENOENT" ? 127 : 1;
+          resolve4({ stdout: out, stderr: err, exitCode: timedOut ? 124 : code, timedOut });
+        });
+      });
+    }
+  };
+}
+var runnerOverride = null;
+function succeeded(result) {
+  return !result.timedOut && result.exitCode === 0;
+}
+function parseContainerList(stdout) {
+  const containers = [];
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.length === 0)
+      continue;
+    const [image = "", name = "", ports = ""] = raw.split("\t");
+    if (image.trim().length === 0 && name.trim().length === 0)
+      continue;
+    containers.push({ image: image.trim(), name: name.trim(), ports: ports.trim() });
+  }
+  return containers;
+}
+function findComposeFiles(repoRoot) {
+  if (!existsSync5(repoRoot))
+    return [];
+  try {
+    return readdirSync5(repoRoot, { withFileTypes: true }).filter((entry) => entry.isFile() && /^(?:docker-)?compose[^/]*\.ya?ml$/i.test(entry.name)).map((entry) => entry.name).sort();
+  } catch {
+    return [];
+  }
+}
+function readComposeTexts(repoRoot, files) {
+  const texts = [];
+  for (const file2 of files) {
+    try {
+      texts.push(readFileSync4(join4(repoRoot, file2), "utf-8"));
+    } catch {}
+  }
+  return texts;
+}
+function collectComposeTexts(repoRoot) {
+  return readComposeTexts(repoRoot, findComposeFiles(repoRoot));
+}
+async function probeContainers(repoRoot, runner = runnerOverride ?? createDefaultRunner()) {
+  for (const runtime of ["docker", "podman"]) {
+    let result;
+    try {
+      result = await runner.run(runtime, PS_ARGS);
+    } catch {
+      continue;
+    }
+    if (succeeded(result)) {
+      return {
+        runtime,
+        containers: parseContainerList(result.stdout),
+        composeHits: [],
+        source: "runtime"
+      };
+    }
+  }
+  const composeHits = collectComposeTexts(repoRoot);
+  if (composeHits.length > 0) {
+    return { runtime: null, containers: [], composeHits, source: "compose" };
+  }
+  return { ...EMPTY_RESULT };
+}
+
+// src/core/project-config.ts
+import { readFile as readFile4, writeFile as writeFile4 } from "node:fs/promises";
+import { existsSync as existsSync6, readdirSync as readdirSync6, readFileSync as readFileSyncNode } from "node:fs";
+import { basename, dirname as dirname3, join as join5 } from "node:path";
+var PROJECT_CONFIG_DIR_NAME = "project-config";
+var CONTAINER_MATCH_FILE = "container-match";
+var APPEND_COMMENT_PREFIX = "# 由编排初始化补齐：";
+var TARGET_LABEL = "扫描平台配置";
+function matchWordAgainstContainers(word, containers) {
+  const pattern = globPattern(word);
+  return containers.some((c) => pattern.test(c.image) || pattern.test(c.name));
+}
+function globPattern(word) {
+  const escaped = word.trim().replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+  return new RegExp(`(?:${escaped})`, "i");
+}
+function readLines(file2) {
+  try {
+    return readFileSyncNode(file2, "utf-8").replace(/^\uFEFF/, "").split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("#"));
+  } catch {
+    return [];
+  }
+}
+function listFiles(dir) {
+  if (!existsSync6(dir))
+    return [];
+  try {
+    return readdirSync6(dir, { withFileTypes: true }).filter((entry) => entry.isFile()).map((entry) => entry.name).sort();
+  } catch {
+    return [];
+  }
+}
+function readTemplate(file2) {
+  try {
+    return readFileSyncNode(file2, "utf-8").replace(/^\uFEFF/, "");
+  } catch {
+    return null;
+  }
+}
+function collectProjectConfigAssets(session, containers, opts = {}) {
+  if (!session || session.project_stacks.length === 0)
+    return [];
+  const index = opts.index ?? scanSkillTags();
+  const assets = [];
+  for (const skill of [...index.skillTags.keys()].sort()) {
+    if (!matchesSessionShapes(index.skillStacks.get(skill) ?? [], session))
+      continue;
+    const skillMd = findSkillPath(skill);
+    if (!skillMd)
+      continue;
+    const configDir = join5(dirname3(skillMd), PROJECT_CONFIG_DIR_NAME);
+    const words = readLines(join5(configDir, CONTAINER_MATCH_FILE));
+    if (words.length === 0)
+      continue;
+    let matchedWords = words.filter((word) => matchWordAgainstContainers(word, containers.containers));
+    let detectedVia = "runtime";
+    if (matchedWords.length === 0 && containers.composeHits.length > 0) {
+      matchedWords = words.filter((word) => {
+        const pattern = globPattern(word);
+        return containers.composeHits.some((text) => pattern.test(text));
+      });
+      detectedVia = containers.runtime === null ? "compose" : "compose-idle";
+    }
+    if (matchedWords.length === 0)
+      continue;
+    for (const name of listFiles(configDir)) {
+      if (name === CONTAINER_MATCH_FILE)
+        continue;
+      const template = readTemplate(join5(configDir, name));
+      if (template === null)
+        continue;
+      assets.push({ skill, target: name, template, matchedWords, detectedVia });
+    }
+  }
+  return assets;
+}
+function projectSlug(repoRoot) {
+  const raw = basename(repoRoot).toLowerCase();
+  const slug = raw.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug.length > 0 ? slug : "project";
+}
+function renderProjectConfigTemplate(template, slug) {
+  return template.replace(/\{\{project\.(name|key)\}\}/g, slug);
+}
+function parseConfigKeys(content) {
+  const keys = new Set;
+  for (const raw of content.split(/\r?\n/)) {
+    const m = raw.match(/^\s*([A-Za-z0-9_.\-]+)\s*=/);
+    if (m)
+      keys.add(m[1]);
+  }
+  return keys;
+}
+function missingTemplateLines(template, existingKeys) {
+  const missing = [];
+  const seen = new Set;
+  for (const raw of template.split(/\r?\n/)) {
+    const m = raw.match(/^\s*([A-Za-z0-9_.\-]+)\s*=/);
+    if (!m)
+      continue;
+    const key = m[1];
+    if (existingKeys.has(key) || seen.has(key))
+      continue;
+    seen.add(key);
+    missing.push(raw);
+  }
+  return missing;
+}
+function ensureTrailingEol(content, eol) {
+  return content.length > 0 && !content.endsWith(`
+`) ? `${content}${eol}` : content;
+}
+var CONFIG_KEY_LINE = /^\s*([A-Za-z0-9_.\-]+)\s*=\s*(.*)$/;
+function mergeTemplatesByKey(group, slug) {
+  const baseLines = renderProjectConfigTemplate(group[0].template, slug).split(/\r?\n/);
+  const values = new Map;
+  for (const raw of baseLines) {
+    const m = raw.match(CONFIG_KEY_LINE);
+    if (!m || values.has(m[1]))
+      continue;
+    values.set(m[1], { value: m[2].trim(), skill: group[0].skill });
+  }
+  const appended = [];
+  const conflicts = [];
+  for (const asset of group.slice(1)) {
+    const rendered = renderProjectConfigTemplate(asset.template, slug);
+    for (const raw of rendered.split(/\r?\n/)) {
+      const m = raw.match(CONFIG_KEY_LINE);
+      if (!m)
+        continue;
+      const key = m[1];
+      const value = m[2].trim();
+      const known = values.get(key);
+      if (!known) {
+        values.set(key, { value, skill: asset.skill });
+        appended.push(raw);
+        continue;
+      }
+      if (known.value === value)
+        continue;
+      const existing = conflicts.find((c) => c.key === key);
+      if (existing) {
+        if (!existing.sources.includes(asset.skill))
+          existing.sources.push(asset.skill);
+      } else {
+        conflicts.push({ key, sources: [known.skill, asset.skill] });
+      }
+    }
+  }
+  while (baseLines.length > 0 && baseLines[baseLines.length - 1].trim() === "")
+    baseLines.pop();
+  return { lines: [...baseLines, ...appended], conflicts };
+}
+function mergeDetectedVia(group) {
+  if (group.some((a) => a.detectedVia === "compose-idle"))
+    return "compose-idle";
+  if (group.some((a) => a.detectedVia === "compose"))
+    return "compose";
+  return "runtime";
+}
+async function ensureProjectConfigs(repoRoot, assets, opts = {}) {
+  const groups = new Map;
+  for (const asset of assets) {
+    const list = groups.get(asset.target) ?? [];
+    list.push(asset);
+    groups.set(asset.target, list);
+  }
+  const slug = projectSlug(repoRoot);
+  const targets = [];
+  for (const [target, group] of [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    const sources = [...new Set(group.map((a) => a.skill))].map((s) => `skill \`${s}\``);
+    const detectedVia = mergeDetectedVia(group);
+    const merged = mergeTemplatesByKey(group, slug);
+    const filePath = join5(repoRoot, target);
+    let before = null;
+    try {
+      before = await readFile4(filePath, "utf-8");
+    } catch {
+      before = null;
+    }
+    if (before === null) {
+      const text = merged.lines.join(`
+`);
+      const content2 = text.endsWith(`
+`) ? text : `${text}
+`;
+      if (!opts.dryRun)
+        await writeFile4(filePath, content2, "utf-8");
+      targets.push({
+        target,
+        action: "created",
+        addedKeys: [],
+        sources,
+        detectedVia,
+        conflicts: merged.conflicts
+      });
+      continue;
+    }
+    const existingKeys = parseConfigKeys(before);
+    const addedKeys = [];
+    const lines = [];
+    for (const asset of group) {
+      const rendered = renderProjectConfigTemplate(asset.template, slug);
+      for (const line of missingTemplateLines(rendered, existingKeys)) {
+        const key = line.match(/^\s*([A-Za-z0-9_.\-]+)/)?.[1];
+        if (key && existingKeys.has(key))
+          continue;
+        if (key) {
+          existingKeys.add(key);
+          addedKeys.push(key);
+        }
+        lines.push(line);
+      }
+    }
+    if (addedKeys.length === 0) {
+      targets.push({ target, action: "complete", addedKeys: [], sources, detectedVia, conflicts: merged.conflicts });
+      continue;
+    }
+    const eol = before.includes(`\r
+`) ? `\r
+` : `
+`;
+    const parts = before.includes(APPEND_COMMENT_PREFIX) ? lines : [`${APPEND_COMMENT_PREFIX}${sources.join("、")}`, ...lines];
+    const content = `${ensureTrailingEol(before, eol)}${parts.join(eol)}${eol}`;
+    if (!opts.dryRun)
+      await writeFile4(filePath, content, "utf-8");
+    targets.push({ target, action: "appended", addedKeys, sources, detectedVia, conflicts: merged.conflicts });
+  }
+  return { targets };
+}
+function renderProjectConfigSkip(reason) {
+  const detail = reason === "no-session" ? "会话未记录项目栈，跳过。" : reason === "no-runtime" ? "未检测到容器运行时，跳过。" : reason === "no-containers" ? "容器运行时可用，但没有容器在运行，跳过。" : "检测到容器但无匹配的平台，跳过。";
+  return `- **${TARGET_LABEL}**: ${detail}`;
+}
+function renderProjectConfigReport(report) {
+  return report.targets.map((entry) => {
+    const via = entry.detectedVia === "compose-idle" ? "（按 compose 文件识别（容器未在运行））" : entry.detectedVia === "compose" ? "（按 compose 文件识别）" : "";
+    const sources = entry.sources.join("、");
+    const conflictNote = entry.conflicts.length === 0 ? "" : `
+  - 冲突键（同键不同值，已保留首个来源的值）：${entry.conflicts.map((c) => `\`${c.key}\`（${c.sources.map((s) => `skill \`${s}\``).join(" vs ")}）`).join("、")}`;
+    if (entry.action === "created") {
+      return `- **${TARGET_LABEL}**: 已创建 \`${entry.target}\`（来源：${sources}）${via}${conflictNote}`;
+    }
+    if (entry.action === "appended") {
+      const keys = entry.addedKeys.join("、");
+      return `- **${TARGET_LABEL}**: \`${entry.target}\` 已补齐 ${entry.addedKeys.length} 项：${keys}（来源：${sources}）${via}${conflictNote}`;
+    }
+    return `- **${TARGET_LABEL}**: \`${entry.target}\` 已存在且完整。${conflictNote}`;
+  });
+}
+async function ensureProjectConfigsForSession(repoRoot, session, probe, opts = {}) {
+  if (!session || session.project_stacks.length === 0) {
+    return renderProjectConfigSkip("no-session");
+  }
+  const assets = collectProjectConfigAssets(session, probe);
+  const resolved = assets.length === 0 && probe.runtime !== null ? collectProjectConfigAssets(session, { ...probe, composeHits: collectComposeTexts(repoRoot) }) : assets;
+  if (resolved.length === 0) {
+    if (probe.runtime === null && probe.composeHits.length === 0) {
+      return renderProjectConfigSkip("no-runtime");
+    }
+    if (probe.runtime !== null && probe.containers.length === 0) {
+      return renderProjectConfigSkip("no-containers");
+    }
+    return renderProjectConfigSkip("no-match");
+  }
+  const report = await ensureProjectConfigs(repoRoot, resolved, opts);
+  return renderProjectConfigReport(report).join(`
 `);
 }
 
 // src/core/exemptions.ts
-import path4 from "path";
+import path3 from "path";
 import { mkdirSync as mkdirSync2, writeFileSync as writeFileSync2, renameSync } from "node:fs";
-import { readFile as readFile4 } from "node:fs/promises";
+import { readFile as readFile5 } from "node:fs/promises";
 
 // src/core/workflow/reset.ts
 function resolveChildIssueFields(child) {
@@ -36971,6 +37772,92 @@ function exemptionKeyOf(rule, file2, line) {
     return null;
   return [rule, file2, line].join("\x00");
 }
+function normalizeRuleKeys(keys) {
+  if (!keys)
+    return [];
+  return [...new Set(keys.map((k) => k.trim()).filter((k) => k !== ""))].sort();
+}
+function exemptionRecordKeyOf(target) {
+  const pathPattern = target.pathPattern?.trim() ?? "";
+  const ruleKeys = normalizeRuleKeys(target.ruleKeys);
+  if (pathPattern === "" && ruleKeys.length === 0) {
+    return exemptionKeyOf(target.rule, target.file ?? "", target.line ?? 0);
+  }
+  const rule = target.rule ?? "";
+  return ["pattern", pathPattern, ruleKeys.join(","), rule, target.file ?? "", target.line ?? 0].join("\x00");
+}
+function pathMatchesGlob(pattern, target) {
+  const p = pattern.replace(/\\/g, "/").replace(/^\.\//, "");
+  const t = target.replace(/\\/g, "/").replace(/^\.\//, "");
+  return globToRegExp(p).test(t);
+}
+function globToRegExp(pattern) {
+  let out = "^";
+  for (let i = 0;i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "*") {
+      if (pattern[i + 1] === "*") {
+        i++;
+        if (pattern[i + 1] === "/") {
+          i++;
+          out += "(?:.*/)?";
+        } else {
+          out += ".*";
+        }
+      } else {
+        out += "[^/]*";
+      }
+    } else if (ch === "?") {
+      out += "[^/]";
+    } else {
+      out += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return new RegExp(`${out}$`);
+}
+function isSuppressionIntent(record3) {
+  return (record3.pathPattern ?? "") !== "" || normalizeRuleKeys(record3.ruleKeys).length > 0;
+}
+function matchesExemption(issue2, record3) {
+  const recordKeys = normalizeRuleKeys(record3.ruleKeys);
+  const hasPathDimension = (record3.pathPattern ?? "") !== "" || record3.file !== undefined;
+  const hasRuleDimension = (record3.rule ?? "") !== "" || recordKeys.length > 0;
+  if (!hasPathDimension && !hasRuleDimension)
+    return false;
+  const isPatternRecord = (record3.pathPattern ?? "") !== "" || recordKeys.length > 0;
+  if (hasPathDimension) {
+    const issueFile = issue2.file ?? "";
+    const recordPattern = record3.pathPattern ?? "";
+    if (recordPattern !== "") {
+      if (issueFile === "" || !pathMatchesGlob(recordPattern, issueFile))
+        return false;
+    } else if (issueFile !== (record3.file ?? "")) {
+      return false;
+    }
+    if (record3.line !== undefined && (!isPatternRecord || record3.line > 0) && issue2.line !== record3.line)
+      return false;
+  }
+  if (hasRuleDimension) {
+    const issueRule = issue2.rule ?? "";
+    const issueKeys = normalizeRuleKeys(issue2.ruleKeys);
+    const recordRule = record3.rule ?? "";
+    const ruleHit = issueRule !== "" && (issueRule === recordRule || recordKeys.includes(issueRule)) || recordRule !== "" && issueKeys.includes(recordRule) || recordKeys.some((k) => issueKeys.includes(k));
+    if (!ruleHit)
+      return false;
+  }
+  return true;
+}
+function exemptionTargetOfChild(child) {
+  const f = resolveChildIssueFields(child);
+  const rawKeys = child.metadata["rule_keys"];
+  return {
+    rule: typeof child.metadata["rule"] === "string" ? child.metadata["rule"] : undefined,
+    file: f.file,
+    line: f.line,
+    pathPattern: typeof child.metadata["path_pattern"] === "string" ? child.metadata["path_pattern"] : undefined,
+    ruleKeys: Array.isArray(rawKeys) ? rawKeys.filter((k) => typeof k === "string") : undefined
+  };
+}
 function emptyStore() {
   return { version: EXEMPTIONS_SCHEMA_VERSION, items: [] };
 }
@@ -36979,9 +37866,9 @@ async function exemptionsDir(worktree) {
   return getStateDir(root);
 }
 async function readExemptions(worktree) {
-  const fp = path4.join(await exemptionsDir(worktree), EXEMPTIONS_FILE);
+  const fp = path3.join(await exemptionsDir(worktree), EXEMPTIONS_FILE);
   try {
-    const parsed = JSON.parse(await readFile4(fp, "utf-8"));
+    const parsed = JSON.parse(await readFile5(fp, "utf-8"));
     if (parsed && Array.isArray(parsed.items)) {
       return { version: parsed.version ?? EXEMPTIONS_SCHEMA_VERSION, items: parsed.items };
     }
@@ -36993,15 +37880,15 @@ async function readExemptions(worktree) {
 async function writeExemptions(worktree, store) {
   const dir = await exemptionsDir(worktree);
   mkdirSync2(dir, { recursive: true });
-  const target = path4.join(dir, EXEMPTIONS_FILE);
-  const tmp = path4.join(dir, `${EXEMPTIONS_FILE}.tmp`);
+  const target = path3.join(dir, EXEMPTIONS_FILE);
+  const tmp = path3.join(dir, `${EXEMPTIONS_FILE}.tmp`);
   writeFileSync2(tmp, JSON.stringify(store, null, 2));
   renameSync(tmp, target);
 }
 async function upsertExemption(worktree, record3) {
   const dir = await exemptionsDir(worktree);
   mkdirSync2(dir, { recursive: true });
-  const lockPath = path4.join(dir, EXEMPTIONS_LOCK);
+  const lockPath = path3.join(dir, EXEMPTIONS_LOCK);
   await acquireLock(lockPath);
   try {
     const store = await readExemptions(worktree);
@@ -37017,16 +37904,19 @@ async function upsertExemption(worktree, record3) {
   }
 }
 function buildExemptionRecord(child, opts) {
-  const rule = typeof child.metadata["rule"] === "string" ? child.metadata["rule"] : undefined;
-  const f = resolveChildIssueFields(child);
-  const key = exemptionKeyOf(rule, f.file, f.line);
+  const target = exemptionTargetOfChild(child);
+  const ruleKeys = normalizeRuleKeys(target.ruleKeys);
+  const key = exemptionRecordKeyOf(target);
   if (!key)
     return null;
+  const f = resolveChildIssueFields(child);
   return {
     key,
-    rule,
-    file: f.file,
-    line: f.line,
+    rule: target.rule,
+    file: target.file,
+    pathPattern: target.pathPattern,
+    ruleKeys: ruleKeys.length > 0 ? ruleKeys : undefined,
+    line: target.line,
     sourcePhase: f.sourcePhase,
     dimension: f.dimension,
     severity: child.severity ?? "",
@@ -37047,19 +37937,17 @@ async function writeDismissedExemption(worktree, child, opts) {
   }
 }
 function applyExemptionDowngrade(children, store) {
-  const keys = new Set(store.items.map((i) => i.key));
   let downgraded = 0;
   for (const c of children) {
-    const rule = typeof c.metadata["rule"] === "string" ? c.metadata["rule"] : undefined;
-    const file2 = typeof c.metadata["file"] === "string" ? c.metadata["file"] : "";
-    const line = typeof c.metadata["line"] === "number" ? c.metadata["line"] : 0;
-    const key = exemptionKeyOf(rule, file2, line);
-    if (key && keys.has(key)) {
+    const target = exemptionTargetOfChild(c);
+    const hit = store.items.find((record3) => matchesExemption(target, record3));
+    if (hit) {
+      const label = hit.rule ?? normalizeRuleKeys(hit.ruleKeys).join(",");
       c.severity = "Info";
-      c.metadata[EXEMPTED_HIT_KEY] = rule ?? true;
+      c.metadata[EXEMPTED_HIT_KEY] = label !== "" ? label : true;
       c.description = `${c.description}
 
-> 命中项目级豁免清单${rule ? `（rule=${rule}）` : ""}，保持现状。`;
+> 命中项目级豁免清单${label ? `（rule=${label}）` : ""}，保持现状。`;
       downgraded++;
     }
   }
@@ -40383,7 +41271,9 @@ function projectIssueFromChild(child) {
     rootCauseGuess: typeof child.metadata["root_cause_guess"] === "string" ? child.metadata["root_cause_guess"] : null,
     exemptReason: typeof child.metadata["exempt_reason"] === "string" ? child.metadata["exempt_reason"] : null,
     rejectReason: typeof child.metadata["reject_reason"] === "string" ? child.metadata["reject_reason"] : null,
-    rule: typeof child.metadata["rule"] === "string" ? child.metadata["rule"] : undefined
+    rule: typeof child.metadata["rule"] === "string" ? child.metadata["rule"] : undefined,
+    pathPattern: typeof child.metadata["path_pattern"] === "string" ? child.metadata["path_pattern"] : undefined,
+    ruleKeys: Array.isArray(child.metadata["rule_keys"]) ? child.metadata["rule_keys"].filter((k) => typeof k === "string") : undefined
   };
 }
 function workItemPhaseToTaskGroupStatus(phase) {
@@ -40430,17 +41320,17 @@ function taskGroupFromWorkItem(item) {
 }
 
 // src/core/paths.ts
-import path5 from "node:path";
+import path4 from "node:path";
 function isPathWithin(base, target) {
-  const rel = path5.relative(path5.resolve(base), path5.resolve(base, target));
-  return rel === "" || !rel.startsWith("..") && !path5.isAbsolute(rel);
+  const rel = path4.relative(path4.resolve(base), path4.resolve(base, target));
+  return rel === "" || !rel.startsWith("..") && !path4.isAbsolute(rel);
 }
 function assertPathWithin(base, target, subject) {
   if (!isPathWithin(base, target)) {
-    throw new Error(`${subject}路径 "${target}" 超出允许目录（\`${path5.resolve(base)}\`），已拒绝。
+    throw new Error(`${subject}路径 "${target}" 超出允许目录（\`${path4.resolve(base)}\`），已拒绝。
 ` + `路径必须位于该目录之内，禁止用 ".." 或绝对路径逃逸到主仓库/主分支。`);
   }
-  return path5.resolve(base, target);
+  return path4.resolve(base, target);
 }
 function assertIssueFilesWithin(issues, base) {
   if (!base)
@@ -40452,189 +41342,23 @@ function assertIssueFilesWithin(issues, base) {
 }
 
 // src/core/workflow/loader.ts
-import { readFileSync as readFileSync3, existsSync as existsSync4 } from "node:fs";
-import { dirname as dirname2, resolve as pathResolve } from "node:path";
-import { fileURLToPath as fileURLToPath2 } from "node:url";
-
-// src/skills/resolve.ts
-import { readdirSync as readdirSync3, readFileSync as readFileSync2, existsSync as existsSync3 } from "node:fs";
-import { resolve as resolve2 } from "node:path";
-
-// src/skills/scan.ts
-import { existsSync as existsSync2, readdirSync as readdirSync2 } from "node:fs";
-import { resolve, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
-var projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-function resolveSkillScanRoot(moduleUrl) {
-  const startDir = dirname(fileURLToPath(moduleUrl));
-  let dir = startDir;
-  for (;; ) {
-    for (const candidate of [resolve(dir, "assets", "skills"), resolve(dir, "skills")]) {
-      if (isSkillRoot(candidate))
-        return candidate;
-    }
-    const parent = dirname(dir);
-    if (parent === dir)
-      break;
-    dir = parent;
-  }
-  return null;
-}
-function isSkillRoot(candidate) {
-  if (!existsSync2(candidate))
-    return false;
-  try {
-    return readdirSync2(candidate, { withFileTypes: true }).some((entry) => entry.isDirectory() && existsSync2(join(candidate, entry.name, "SKILL.md")));
-  } catch {
-    return false;
-  }
-}
-var scanRoot = resolveSkillScanRoot(import.meta.url);
-var REPO_SKILL_SCAN_ROOTS = [
-  ...scanRoot ? [scanRoot] : [],
-  resolve(projectRoot, ".agents", "skills"),
-  resolve(projectRoot, ".opencode", "skills")
-];
-var SKILL_SCAN_ROOTS = [
-  ...REPO_SKILL_SCAN_ROOTS,
-  join(homedir(), ".agents", "skills"),
-  join(homedir(), ".config", "opencode", "skills")
-];
-var rootsOverride = null;
-function effectiveSkillScanRoots() {
-  return rootsOverride ?? SKILL_SCAN_ROOTS;
-}
-function findSkillPath(name) {
-  for (const root of effectiveSkillScanRoots()) {
-    const p = resolve(root, name, "SKILL.md");
-    if (existsSync2(p))
-      return p;
-  }
-  return null;
-}
-
-// src/skills/resolve.ts
-var cacheKey = null;
-var cacheIndex = null;
-function parseFrontmatterList(raw, field) {
-  const m = raw.match(new RegExp(`${field}:\\s*\\[([^\\]]*)\\]`));
-  if (!m)
-    return null;
-  return m[1].split(",").map((s) => s.trim().replace(/["']/g, "")).filter(Boolean);
-}
-function scanSkillTags(roots = effectiveSkillScanRoots()) {
-  const key = roots.join("\x00");
-  if (cacheKey === key && cacheIndex)
-    return cacheIndex;
-  const tagMap = new Map;
-  const skillTags = new Map;
-  const skillStacks = new Map;
-  const skillFrameworks = new Map;
-  const seen = new Set;
-  for (const root of roots) {
-    if (!existsSync3(root))
-      continue;
-    for (const entry of readdirSync3(root, { withFileTypes: true })) {
-      if (!entry.isDirectory())
-        continue;
-      if (seen.has(entry.name))
-        continue;
-      const mdPath = resolve2(root, entry.name, "SKILL.md");
-      if (!existsSync3(mdPath))
-        continue;
-      try {
-        const raw = readFileSync2(mdPath, "utf-8");
-        const tags = parseFrontmatterList(raw, "capabilities");
-        if (!tags)
-          continue;
-        skillTags.set(entry.name, tags);
-        for (const tag of tags) {
-          const arr = tagMap.get(tag) || [];
-          arr.push(entry.name);
-          tagMap.set(tag, arr);
-        }
-        const stacks = parseFrontmatterList(raw, "stacks");
-        if (stacks && stacks.length > 0)
-          skillStacks.set(entry.name, stacks);
-        const frameworks = parseFrontmatterList(raw, "frameworks");
-        if (frameworks && frameworks.length > 0)
-          skillFrameworks.set(entry.name, frameworks);
-        seen.add(entry.name);
-      } catch {}
-    }
-  }
-  cacheKey = key;
-  cacheIndex = { tagMap, skillTags, skillStacks, skillFrameworks };
-  return cacheIndex;
-}
-function resolveSkillsForCapabilities(caps, session, index) {
-  if (!caps || caps.length === 0)
-    return { skillNames: [] };
-  const idx = index ?? scanSkillTags();
-  const { tagMap, skillStacks, skillFrameworks } = idx;
-  const matched = new Set;
-  for (const cap of caps) {
-    for (const n of tagMap.get(cap) || [])
-      matched.add(n);
-  }
-  const skillNames = [];
-  for (const name of matched) {
-    const declaredStacks = skillStacks.get(name) ?? [];
-    const declaredFrameworks = skillFrameworks.get(name) ?? [];
-    if (session === null) {
-      if (declaredStacks.length > 0 || declaredFrameworks.length > 0)
-        continue;
-    } else if (session && !matchesSessionStacks(declaredStacks, declaredFrameworks, session))
-      continue;
-    skillNames.push(name);
-  }
-  return { skillNames };
-}
-
-// src/skills/stacks.ts
-function matchesSessionStacks(stacks, frameworks, session) {
-  if (stacks.length > 0 && !stacks.some((t) => session.project_stacks.includes(t)))
-    return false;
-  if (frameworks.length > 0 && !frameworks.some((t) => session.project_frameworks.includes(t)))
-    return false;
-  return true;
-}
-var knownTagsOverride = null;
-function knownStacks(index = scanSkillTags()) {
-  if (knownTagsOverride)
-    return new Set(knownTagsOverride.stacks);
-  const tags = new Set;
-  for (const list of index.skillStacks.values())
-    for (const tag of list)
-      tags.add(tag);
-  return tags;
-}
-function knownFrameworks(index = scanSkillTags()) {
-  if (knownTagsOverride)
-    return new Set(knownTagsOverride.frameworks);
-  const tags = new Set;
-  for (const list of index.skillFrameworks.values())
-    for (const tag of list)
-      tags.add(tag);
-  return tags;
-}
-
-// src/core/workflow/loader.ts
+import { readFileSync as readFileSync5, existsSync as existsSync7 } from "node:fs";
+import { dirname as dirname4, resolve as pathResolve } from "node:path";
+import { fileURLToPath as fileURLToPath3 } from "node:url";
 var SPECIAL_TRANSITIONS = ["done", "halt"];
 var PHASE_NAMES = new Set(WORK_ITEM_PHASES);
 var QUALITY_REVIEW_STEP_ID = "verify_quality";
 var MUST_DO_ALWAYS_KEY = "always";
 function resolveWorkflowFilePath(moduleUrl, fileName) {
-  const startDir = dirname2(fileURLToPath2(moduleUrl));
+  const startDir = dirname4(fileURLToPath3(moduleUrl));
   let dir = startDir;
   let probed = 0;
   for (;; ) {
     const candidate = pathResolve(dir, "assets", "workflows", fileName);
-    if (existsSync4(candidate))
+    if (existsSync7(candidate))
       return candidate;
     probed++;
-    const parent = dirname2(dir);
+    const parent = dirname4(dir);
     if (parent === dir)
       break;
     dir = parent;
@@ -40651,7 +41375,7 @@ var TASK_WORKFLOW_PATH = resolveTaskWorkflowPath(import.meta.url);
 var SIMPLE_WORKFLOW_PATH = resolveWorkflowFilePath(import.meta.url, "task-simple.yaml");
 var REVIEW_WORKFLOW_PATH = resolveWorkflowFilePath(import.meta.url, "review.yaml");
 var REVIEW_SIMPLE_WORKFLOW_PATH = resolveWorkflowFilePath(import.meta.url, "review-simple.yaml");
-var MUST_DO_CATALOG = loadMustDoCatalog(readFileSync3(resolveMustDoCatalogPath(import.meta.url), "utf-8"));
+var MUST_DO_CATALOG = loadMustDoCatalog(readFileSync5(resolveMustDoCatalogPath(import.meta.url), "utf-8"));
 function resolveWorkflowPath(state) {
   if (state.kind === "review") {
     return state.reviewScope?.granularity === "simple" ? REVIEW_SIMPLE_WORKFLOW_PATH : REVIEW_WORKFLOW_PATH;
@@ -40662,7 +41386,7 @@ var workflowFileCache = new Map;
 function loadWorkflowFile(filePath) {
   let wf = workflowFileCache.get(filePath);
   if (!wf) {
-    wf = loadWorkflow(readFileSync3(filePath, "utf-8"));
+    wf = loadWorkflow(readFileSync5(filePath, "utf-8"));
     workflowFileCache.set(filePath, wf);
   }
   return wf;
@@ -40736,49 +41460,49 @@ function assertMustDoCatalogReferenced(catalog, workflows) {
 function fail(message) {
   throw new Error(message);
 }
-function expectString(value, path6) {
+function expectString(value, path5) {
   if (typeof value !== "string" || value.trim() === "") {
-    fail(`workflow 配置非法：${path6} 必须是非空字符串，收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path5} 必须是非空字符串，收到 ${JSON.stringify(value)}`);
   }
   return value;
 }
-function expectPositiveInt(value, path6) {
+function expectPositiveInt(value, path5) {
   if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-    fail(`workflow 配置非法：${path6} 必须是正整数，收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path5} 必须是正整数，收到 ${JSON.stringify(value)}`);
   }
   return value;
 }
-function expectStringArray(value, path6) {
+function expectStringArray(value, path5) {
   if (!Array.isArray(value) || value.length === 0 || value.some((v) => typeof v !== "string")) {
-    fail(`workflow 配置非法：${path6} 必须是非空字符串数组，收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path5} 必须是非空字符串数组，收到 ${JSON.stringify(value)}`);
   }
   return value;
 }
-function expectAgentList(value, path6) {
+function expectAgentList(value, path5) {
   if (!Array.isArray(value) || value.length === 0) {
-    fail(`workflow 配置非法：${path6} 必须是非空对象数组（每个元素含 id 与 capability_tags），收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path5} 必须是非空对象数组（每个元素含 id 与 capability_tags），收到 ${JSON.stringify(value)}`);
   }
   return value.map((v, i) => {
     if (typeof v !== "object" || v === null || Array.isArray(v)) {
-      fail(`workflow 配置非法：${path6}[${i}] 必须是对象（含 id 与 capability_tags），收到 ${JSON.stringify(v)}`);
+      fail(`workflow 配置非法：${path5}[${i}] 必须是对象（含 id 与 capability_tags），收到 ${JSON.stringify(v)}`);
     }
     const a = v;
     return {
-      id: expectString(a.id, `${path6}[${i}].id`),
-      capability_tags: expectStringArray(a.capability_tags, `${path6}[${i}].capability_tags`)
+      id: expectString(a.id, `${path5}[${i}].id`),
+      capability_tags: expectStringArray(a.capability_tags, `${path5}[${i}].capability_tags`)
     };
   });
 }
-function expectOptionalPositiveInt(value, path6) {
+function expectOptionalPositiveInt(value, path5) {
   if (value === undefined)
     return;
-  return expectPositiveInt(value, path6);
+  return expectPositiveInt(value, path5);
 }
-function expectOptionalNonEmptyStringArray(value, path6) {
+function expectOptionalNonEmptyStringArray(value, path5) {
   if (value === undefined)
     return;
   if (!Array.isArray(value) || value.length === 0 || value.some((v) => typeof v !== "string" || v.trim() === "")) {
-    fail(`workflow 配置非法：${path6} 必须是非空字符串数组，收到 ${JSON.stringify(value)}`);
+    fail(`workflow 配置非法：${path5} 必须是非空字符串数组，收到 ${JSON.stringify(value)}`);
   }
   return value;
 }
@@ -40911,8 +41635,165 @@ assertMustDoCatalogReferenced(MUST_DO_CATALOG, [
   REVIEW_SIMPLE_WORKFLOW_PATH
 ].map((p) => loadWorkflowFile(p)));
 
+// src/core/suppression.ts
+import { existsSync as existsSync8, readFileSync as readFileSync6 } from "node:fs";
+import { dirname as dirname5, join as join7 } from "node:path";
+var SUPPRESSION_CONFIG_FILE = "suppression-config.yaml";
+function stripBom(text) {
+  return text.replace(/^\uFEFF/, "");
+}
+function parseSuppressionConfigWithSkips(content) {
+  let raw;
+  try {
+    raw = yaml.load(stripBom(content));
+  } catch {
+    return { declarations: [], skippedDeclarations: 1 };
+  }
+  if (raw === undefined || raw === null)
+    return { declarations: [], skippedDeclarations: 0 };
+  if (!Array.isArray(raw))
+    return { declarations: [], skippedDeclarations: 1 };
+  const declarations = [];
+  let skippedDeclarations = 0;
+  for (const item of raw) {
+    if (item === null || typeof item !== "object") {
+      skippedDeclarations += 1;
+      continue;
+    }
+    const rec = item;
+    const file2 = typeof rec.file === "string" ? rec.file.trim() : "";
+    if (file2 === "") {
+      skippedDeclarations += 1;
+      continue;
+    }
+    if (rec.format === "glob-list") {
+      declarations.push({ file: file2, format: "glob-list" });
+    } else if (rec.format === "properties-key-glob-list") {
+      const key = typeof rec.key === "string" ? rec.key.trim() : "";
+      if (key === "") {
+        skippedDeclarations += 1;
+        continue;
+      }
+      declarations.push({ file: file2, format: "properties-key-glob-list", key });
+    } else {
+      skippedDeclarations += 1;
+    }
+  }
+  return { declarations, skippedDeclarations };
+}
+function splitGlobList(value) {
+  return value.split(",").map((s) => s.trim()).filter((s) => s !== "" && !s.startsWith("#"));
+}
+function parsePropertiesGlobList(content, key) {
+  const logical = [];
+  let buffer = null;
+  for (const rawLine of stripBom(content).split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (buffer === null) {
+      if (line === "" || line.startsWith("#") || line.startsWith("!"))
+        continue;
+      buffer = line;
+    } else {
+      buffer += line;
+    }
+    if (buffer.endsWith("\\")) {
+      buffer = buffer.slice(0, -1);
+      continue;
+    }
+    logical.push(buffer);
+    buffer = null;
+  }
+  if (buffer !== null && buffer !== "")
+    logical.push(buffer);
+  const out = [];
+  for (const line of logical) {
+    const eq = line.indexOf("=");
+    if (eq < 0)
+      continue;
+    if (line.slice(0, eq).trim() !== key)
+      continue;
+    out.push(...splitGlobList(line.slice(eq + 1)));
+  }
+  return out;
+}
+function parseGlobList(content) {
+  return stripBom(content).split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== "" && !line.startsWith("#"));
+}
+function entryMatchesExemption(entry, record3) {
+  const recordPattern = record3.pathPattern ?? "";
+  if (recordPattern !== "") {
+    if (recordPattern === entry.pattern)
+      return true;
+    if (pathMatchesGlob(entry.pattern, recordPattern))
+      return true;
+    if (pathMatchesGlob(recordPattern, entry.pattern))
+      return true;
+  }
+  const recordFile = record3.file ?? "";
+  return recordFile !== "" && pathMatchesGlob(entry.pattern, recordFile);
+}
+function collectSuppressionSnapshot(repoRoot, session, opts = {}) {
+  if (!session || session.project_stacks.length === 0) {
+    return { entries: [], skippedDeclarations: 0 };
+  }
+  const index = opts.index ?? scanSkillTags();
+  const seen = new Set;
+  const entries = [];
+  let skippedDeclarations = 0;
+  for (const skill of [...index.skillTags.keys()].sort()) {
+    if (!matchesSessionShapes(index.skillStacks.get(skill) ?? [], session))
+      continue;
+    const skillMd = findSkillPath(skill);
+    if (!skillMd)
+      continue;
+    const configPath = join7(dirname5(skillMd), SUPPRESSION_CONFIG_FILE);
+    if (!existsSync8(configPath))
+      continue;
+    let declarations = [];
+    try {
+      const parsed = parseSuppressionConfigWithSkips(readFileSync6(configPath, "utf-8"));
+      declarations = parsed.declarations;
+      skippedDeclarations += parsed.skippedDeclarations;
+    } catch {
+      skippedDeclarations += 1;
+      continue;
+    }
+    for (const decl of declarations) {
+      const target = join7(repoRoot, decl.file);
+      if (!existsSync8(target))
+        continue;
+      let content;
+      try {
+        content = readFileSync6(target, "utf-8");
+      } catch {
+        continue;
+      }
+      const patterns = decl.format === "properties-key-glob-list" ? parsePropertiesGlobList(content, decl.key ?? "") : parseGlobList(content);
+      const source = `skill \`${skill}\` · ${decl.file}${decl.key ? `#${decl.key}` : ""}`;
+      for (const pattern of patterns) {
+        const dedupeKey = `${decl.file}\x00${pattern}`;
+        if (seen.has(dedupeKey))
+          continue;
+        seen.add(dedupeKey);
+        entries.push({ file: decl.file, pattern, source });
+      }
+    }
+  }
+  return {
+    entries: entries.sort((a, b) => a.file === b.file ? a.pattern.localeCompare(b.pattern) : a.file.localeCompare(b.file)),
+    skippedDeclarations
+  };
+}
+function checkSuppressionConsistency(entries, exemptions) {
+  const intents = exemptions.filter(isSuppressionIntent);
+  return {
+    unmatchedConfig: entries.filter((entry) => !intents.some((record3) => entryMatchesExemption(entry, record3))),
+    unmatchedExemptions: intents.filter((record3) => !entries.some((entry) => entryMatchesExemption(entry, record3)))
+  };
+}
+
 // src/core/views.ts
-import { readFileSync as readFileSync4 } from "node:fs";
+import { readFileSync as readFileSync7 } from "node:fs";
 
 // src/core/tools/gate.ts
 var SKIP_REASON_ADJUDICATIONS = ["user_response", "unattended_auto", "env_unavailable"];
@@ -41079,7 +41960,7 @@ function renderSkillSuggestions(agent, caps, session) {
     if (!mdPath)
       continue;
     try {
-      const raw = readFileSync4(mdPath, "utf-8");
+      const raw = readFileSync7(mdPath, "utf-8");
       if (!raw.includes("boundary_hints:"))
         continue;
       const dm = raw.match(/directories:\s*\[([^\]]*)\]/);
@@ -41242,14 +42123,17 @@ function interpolateText(text, ctx) {
 // src/core/workflow/status.ts
 function renderWorkflowStatusView(item, workflow, rec, caller, options) {
   const body = renderWorkflowStatusViewCore(item, workflow, rec, caller, options);
-  if (options.state.stacks)
+  const notices = [];
+  if (options.state.stacks) {
+    for (const warning of shapeCoverageWarnings(options.state.stacks)) {
+      notices.push(`> ⚠️ ${warning}`);
+    }
+  } else {
+    notices.push("> **旧会话未固化项目栈**：当前只加载通用 skill，技术栈配套 skill 与其必做项不参与。", "> 补齐方式：调用 `opx_orch_init` 并携带 `project_stacks` / `project_frameworks`（可用 `recovery` 恢复当前进度）。");
+  }
+  if (notices.length === 0)
     return body;
-  return [
-    "> **旧会话未固化项目栈**：当前只加载通用 skill，技术栈配套 skill 与其必做项不参与。",
-    "> 补齐方式：调用 `opx_orch_init` 并携带 `project_stacks` / `project_frameworks`（可用 `recovery` 恢复当前进度）。",
-    "",
-    body
-  ].join(`
+  return [...notices, "", body].join(`
 `);
 }
 function renderWorkflowStatusViewCore(item, workflow, rec, caller, options) {
@@ -41285,23 +42169,14 @@ function renderWorkflowStatusViewCore(item, workflow, rec, caller, options) {
   }
   if (rec.agents.includes(ctxAgent)) {
     const step = rec.stepId ? workflow.stepMap.get(rec.stepId)?.step ?? null : null;
-    return renderAgentWorking(item, rec, step, workflow.common, ctxAgent, options.state, options.tg, workflow.mustDoCatalog, options.toolChanges, options.exemptedHits, exemptionHintCtx(options.exemptionItems));
+    return renderAgentWorking(item, rec, step, workflow.common, ctxAgent, options.state, options.tg, workflow.mustDoCatalog, options.toolChanges, options.exemptedHits, exemptionHintCtx(options.exemptionItems), options.exemptionItems);
   }
   return renderGate(rec, item, ctxAgent);
-}
-function buildRuleFileLineMap(items) {
-  const m = new Map;
-  for (const it of items) {
-    if (typeof it.rule === "string" && it.rule !== "" && typeof it.file === "string" && it.file !== "") {
-      m.set([it.rule, it.file].join("\x00"), it.line ?? 0);
-    }
-  }
-  return m;
 }
 function exemptionHintCtx(items) {
   if (!items || items.length === 0)
     return;
-  return { items, ruleFileLines: buildRuleFileLineMap(items) };
+  return { items };
 }
 function renderCheckpoint(rec, workflow, item, state) {
   const round = rec.checkpoint?.retryCount ?? "?";
@@ -41722,7 +42597,7 @@ function renderStateMismatch(item, workflow) {
   ].join(`
 `);
 }
-function renderAgentWorking(item, rec, step, common2, ctxAgent, state, tg, mustDoCatalog, toolChanges, exemptedHits, exemptionCtx) {
+function renderAgentWorking(item, rec, step, common2, ctxAgent, state, tg, mustDoCatalog, toolChanges, exemptedHits, exemptionCtx, exemptionItems) {
   if (!isWorktreeReady(tg)) {
     return [
       "# ⛔ worktree 未就绪，当前拒绝执行",
@@ -41735,13 +42610,15 @@ function renderAgentWorking(item, rec, step, common2, ctxAgent, state, tg, mustD
     ].join(`
 `);
   }
+  const mustDoItems = resolveStepMustDo(step ?? undefined, state.stacks ?? null);
+  const suppressionLines = mustDoItems.includes("config_check") ? renderSuppressionConsistencySection(tg.worktreePath, state.stacks ?? null, exemptionItems) : [];
   if (step?.id === "verify_tool" && agentToReviewLayer(ctxAgent) === "tool" && toolChanges && !toolChanges.scopeFull) {
     const { active, pending } = toolPendingChildren(item, ctxAgent);
     if (!toolChanges.hasNonDocChange && active.length === 0 && pending.length === 0) {
-      return renderToolDirectSubmit(exemptedHits);
+      return renderToolDirectSubmit(exemptedHits, suppressionLines);
     }
     if (!toolChanges.hasNonDocChange) {
-      return renderToolAdjudicateOnly(item, rec, ctxAgent, exemptedHits, exemptionCtx);
+      return renderToolAdjudicateOnly(item, rec, ctxAgent, exemptedHits, exemptionCtx, suppressionLines);
     }
   }
   const caps = step?.agents.find((a) => a.id === ctxAgent)?.capability_tags ?? [];
@@ -41778,8 +42655,8 @@ function renderAgentWorking(item, rec, step, common2, ctxAgent, state, tg, mustD
     lines.push(`> **存量豁免提示**：本 change 存在 ${exemptedHits} 个命中项目级跨 change 豁免清单的存量问题（已按 Info 处理，不阻塞、无需重复豁免）。`, "");
   }
   lines.push(...renderStepSemantics(step, common2, stepCtx));
-  const mustDoItems = resolveStepMustDo(step ?? undefined, state.stacks ?? null);
   lines.push(...renderMustDoChecklist(mustDoItems, mustDoCatalog, rec.stepId));
+  lines.push(...suppressionLines);
   lines.push(...renderWorktreeSection(state, tg, { showNamespace: true, showPort: true }));
   if (step?.id === "verify_tool" && agentToReviewLayer(ctxAgent) === "tool" && toolChanges?.hasNonDocChange) {
     lines.push(...renderToolChangesEvidence(item, tg, toolChanges, "tool_review"));
@@ -42069,7 +42946,53 @@ function renderToolChangesEvidence(item, tg, toolChanges, kind) {
   lines.push("");
   return lines;
 }
-function renderToolDirectSubmit(exemptedHits) {
+function renderSuppressionConsistencySection(repoRoot, session, exemptionItems) {
+  if (!repoRoot)
+    return [];
+  const lines = ["## 配置忽略与豁免一致性", ""];
+  if (!session || session.project_stacks.length === 0) {
+    lines.push("未核对（会话未固化项目栈）。", "");
+    return lines;
+  }
+  const { entries, skippedDeclarations } = collectSuppressionSnapshot(repoRoot, session);
+  const { unmatchedConfig, unmatchedExemptions } = checkSuppressionConsistency(entries, exemptionItems ?? []);
+  const skipLine = skippedDeclarations > 0 ? `已跳过 ${skippedDeclarations} 条未识别声明（format 不在枚举、缺 key 或非数组）。` : "";
+  if (unmatchedConfig.length === 0 && unmatchedExemptions.length === 0) {
+    if (entries.length === 0 && skipLine !== "") {
+      lines.push(skipLine, "");
+      return lines;
+    }
+    lines.push(`配置忽略条目与豁免记录一致（${entries.length} 条）。`, "");
+    if (skipLine !== "")
+      lines.push(skipLine, "");
+    return lines;
+  }
+  lines.push("配置忽略条目与豁免记录必须成对：每条配置忽略要有对应豁免记录，每条豁免记录也要在配置里找到落点。", "");
+  if (skipLine !== "")
+    lines.push(skipLine, "");
+  if (unmatchedConfig.length > 0) {
+    lines.push("配置里有但豁免记录缺失：", "");
+    for (const entry of unmatchedConfig) {
+      lines.push(`- ${entry.file} → ${entry.pattern}（来源：${entry.source}）`);
+    }
+    lines.push("");
+    lines.push("模板基线排除项首次写入时需登记对应豁免记录，登记后本区块才会显示为一致。", "");
+  }
+  if (unmatchedExemptions.length > 0) {
+    lines.push("豁免记录声称配置抑制但配置里无对应忽略：", "");
+    for (const record3 of unmatchedExemptions) {
+      const dimensions = [
+        record3.pathPattern ? `path_pattern=${record3.pathPattern}` : "",
+        record3.ruleKeys && record3.ruleKeys.length > 0 ? `rule_keys=${record3.ruleKeys.join(",")}` : "",
+        record3.file ? `file=${record3.file}` : ""
+      ].filter((s) => s !== "");
+      lines.push(`- 豁免记录：${dimensions.join(" · ")}（change=${record3.changeId}）`);
+    }
+    lines.push("");
+  }
+  return lines;
+}
+function renderToolDirectSubmit(exemptedHits, suppressionLines = []) {
   const lines = [
     "# ✅ 当前轮到你执行",
     "",
@@ -42079,11 +43002,13 @@ function renderToolDirectSubmit(exemptedHits) {
   if ((exemptedHits ?? 0) > 0) {
     lines.push(`> **存量豁免提示**：本 change 存在 ${exemptedHits} 个命中项目级跨 change 豁免清单的存量问题（已按 Info 处理，不阻塞、无需重复豁免）。`, "");
   }
-  lines.push("无需运行全量工具检查。", "", "## 操作指引", "", "1. 提交前须申报本轮必做清单处理结果：以一条 `step` 名首段为 `no_change` 的 `must_do_checks` 条目声明本轮整体豁免必做清单（completed=false，并附结构化 skip_reason 注明判定依据），或按视图「本 step 必做清单」逐项申报（completed=true 附执行结果；无法执行项置 completed=false + 结构化 skip_reason）", `2. 结构化 skip_reason 格式：\`${SKIP_REASON_FORMAT}\``, `3. 调用 \`opx_agent_submit({ step_id: "verify_tool", verdict: "passed", must_do_checks: <必做清单申报结果> })\` 提交通过后结束会话。`, "");
+  lines.push("无需运行全量工具检查。", "");
+  lines.push(...suppressionLines);
+  lines.push("## 操作指引", "", "1. 提交前须申报本轮必做清单处理结果：以一条 `step` 名首段为 `no_change` 的 `must_do_checks` 条目声明本轮整体豁免必做清单（completed=false，并附结构化 skip_reason 注明判定依据），或按视图「本 step 必做清单」逐项申报（completed=true 附执行结果；无法执行项置 completed=false + 结构化 skip_reason）", `2. 结构化 skip_reason 格式：\`${SKIP_REASON_FORMAT}\``, `3. 调用 \`opx_agent_submit({ step_id: "verify_tool", verdict: "passed", must_do_checks: <必做清单申报结果> })\` 提交通过后结束会话。`, "");
   return lines.join(`
 `);
 }
-function renderToolAdjudicateOnly(item, rec, ctxAgent, exemptedHits, exemptionCtx) {
+function renderToolAdjudicateOnly(item, rec, ctxAgent, exemptedHits, exemptionCtx, suppressionLines = []) {
   const lines = [
     "# ✅ 当前轮到你执行",
     "",
@@ -42095,6 +43020,7 @@ function renderToolAdjudicateOnly(item, rec, ctxAgent, exemptedHits, exemptionCt
   }
   lines.push("仅处理以下本层待复核 / 待裁定项，处理完成后提交：", "");
   lines.push(...renderToolChildren(item, ctxAgent, exemptionCtx));
+  lines.push(...suppressionLines);
   lines.push("## 操作指引", "");
   lines.push("1. 逐项复核/裁定上方各项：待复核 issue 经 `recheck_adjudications` 复核（通过置 done、不通过驳回并附驳回原因）；待裁定豁免经 `exempt_adjudications` 裁定（dismissed/rejected）");
   lines.push("2. 提交前须申报本轮必做清单处理结果：以一条 `step` 名首段为 `no_change` 的 `must_do_checks` 条目声明本轮整体豁免必做清单（completed=false + 结构化 skip_reason 注明判定依据），或按视图「本 step 必做清单」逐项申报");
@@ -42203,10 +43129,12 @@ function appendExemptionHints(lines, child, f, exemptionCtx) {
   if (f.sourcePhase === "tool" && rule === "") {
     lines.push("  - 无规则名：豁免结论不会写入跨 change 清单，下个 change 将重新报此问题");
   }
-  if (exemptionCtx && rule !== "" && f.file !== "" && child.metadata[EXEMPTED_HIT_KEY] === undefined) {
-    const hitLine = exemptionCtx.ruleFileLines.get([rule, f.file].join("\x00"));
-    if (hitLine !== undefined && hitLine !== f.line) {
-      lines.push(`  - 疑似行号漂移：豁免清单记录 line=${hitLine}，当前报 line=${f.line}，请核对是否同一问题`);
+  if (exemptionCtx && f.file !== "" && child.metadata[EXEMPTED_HIT_KEY] === undefined) {
+    const target = exemptionTargetOfChild(child);
+    const record3 = exemptionCtx.items.find((it) => matchesExemption({ ...target, line: undefined }, { ...it, line: undefined }));
+    const recordLine = record3?.line ?? 0;
+    if (record3 && recordLine > 0 && recordLine !== f.line) {
+      lines.push(`  - 疑似行号漂移：豁免清单记录 line=${recordLine}，当前报 line=${f.line}，请核对是否同一问题`);
     }
   }
 }
@@ -42607,6 +43535,11 @@ async function initReviewSession(params, ctx) {
       throw new Error(`独立审查会话 "${sessionId}" 已存在且审查范围不同（已固化：${JSON.stringify(state.reviewScope)}，传入：${JSON.stringify(scope)}）。` + `会话 id 由审查范围推导，重复 init 仅支持同参数幂等复用；需不同范围请调整参数（id 随之变化）。`);
     }
     const stacksNote = adoptOrAssertSessionStacks(state, args);
+    const guardSession = state.stacks ?? {
+      project_stacks: args.project_stacks,
+      project_frameworks: args.project_frameworks
+    };
+    const guardNote2 = await runBaselineGuards(ctx, reviewBaselineOpts(scope, guardSession), guardSession);
     if (args.recovery) {
       const item = state.workItems.find((w) => w.id === `task:${REVIEW_TASK_GROUP_ID}`);
       if (!item)
@@ -42614,7 +43547,9 @@ async function initReviewSession(params, ctx) {
       assertValidResetStepValues(args.recovery, state);
       applyRecoveryState(item, args.recovery, [], state);
       await writeState(ctx.worktree, state);
-      return `独立审查会话 "${sessionId}" 已恢复到 review 阶段（当前 step：${item.currentStep ?? "(已收口)"}）。后续工具以 change_id="${sessionId}" 传入。`;
+      return `独立审查会话 "${sessionId}" 已恢复到 review 阶段（当前 step：${item.currentStep ?? "(已收口)"}）。后续工具以 change_id="${sessionId}" 传入。
+
+${guardNote2}`;
     }
     if (stacksNote)
       await writeState(ctx.worktree, state);
@@ -42623,7 +43558,9 @@ async function initReviewSession(params, ctx) {
       "",
       `- **会话 ID**: \`${sessionId}\``,
       `- **说明**: 后续所有 opx_* 工具以 \`change_id="${sessionId}"\` 传入。`,
-      ...stacksNote ? ["", stacksNote] : []
+      ...stacksNote ? ["", stacksNote] : [],
+      "",
+      guardNote2
     ].join(`
 `);
   }
@@ -42643,6 +43580,7 @@ async function initReviewSession(params, ctx) {
     reviewScope: scope,
     stacks: { project_stacks: args.project_stacks, project_frameworks: args.project_frameworks }
   };
+  const guardNote = await runBaselineGuards(ctx, reviewBaselineOpts(scope, state.stacks), state.stacks);
   await writeState(ctx.worktree, state);
   const granularityLabel = scope.granularity === "thorough" ? "三层审查（工具检查 → 回归验证 → 五维度质量审查）" : "单层合并审查";
   const fixLabel = scope.fix === "fix" ? "审并修（失败回退修复后重审）" : "只审不修（issue 报告即交付物）";
@@ -42655,7 +43593,9 @@ async function initReviewSession(params, ctx) {
     `- **颗粒度**: ${granularityLabel}`,
     `- **修复策略**: ${fixLabel}`,
     "",
-    `- **说明**: 后续所有 opx_* 工具以 \`change_id="${sessionId}"\` 传入（含 opx_orch_set_worktree / opx_status / opx_agent_submit / 收尾）。`
+    `- **说明**: 后续所有 opx_* 工具以 \`change_id="${sessionId}"\` 传入（含 opx_orch_set_worktree / opx_status / opx_agent_submit / 收尾）。`,
+    "",
+    guardNote
   ].join(`
 `);
 }
@@ -42683,10 +43623,18 @@ async function initReviewRecovery(params, state, ctx) {
   if (!item)
     throw new Error(`工作项 "task:${REVIEW_TASK_GROUP_ID}" 缺失，会话状态异常，请核对 state 文件。`);
   const stacksNote = adoptOrAssertSessionStacks(state, args);
+  const scope = state.reviewScope;
+  const guardSession = state.stacks ?? {
+    project_stacks: args.project_stacks,
+    project_frameworks: args.project_frameworks
+  };
+  const guardNote = await runBaselineGuards(ctx, reviewBaselineOpts(scope, guardSession), guardSession);
   if (args.recovery) {
     applyRecoveryState(item, args.recovery, [], state);
     await writeState(ctx.worktree, state);
-    return `独立审查会话 "${state.changeId}" 已恢复到 ${args.recovery.phase} 阶段（当前 step：${item.currentStep ?? "(已收口)"}）。`;
+    return `独立审查会话 "${state.changeId}" 已恢复到 ${args.recovery.phase} 阶段（当前 step：${item.currentStep ?? "(已收口)"}）。
+
+${guardNote}`;
   }
   if (stacksNote)
     await writeState(ctx.worktree, state);
@@ -42695,9 +43643,18 @@ async function initReviewRecovery(params, state, ctx) {
     "",
     `- **会话 ID**: \`${state.changeId}\``,
     `- **说明**: 后续所有 opx_* 工具以 \`change_id="${state.changeId}"\` 传入。`,
-    ...stacksNote ? ["", stacksNote] : []
+    ...stacksNote ? ["", stacksNote] : [],
+    "",
+    guardNote
   ].join(`
 `);
+}
+function reviewBaselineOpts(scope, session) {
+  return {
+    baseBranch: scope.scopeType === "pr" ? scope.headRef ?? null : null,
+    skipCommit: scope.fix === "none",
+    session
+  };
 }
 function sameTagSet(a, b) {
   const as = new Set(a);
@@ -42755,24 +43712,35 @@ function assertProjectStacks(args) {
 ` + `形态（stacks）与框架（frameworks）分字段校验、不可混用；请传入任一 skill frontmatter 对应字段的声明值。`);
     }
   }
+  const conflicts = conflictingFrameworks({
+    project_stacks: args.project_stacks,
+    project_frameworks: args.project_frameworks
+  });
+  if (conflicts.length > 0) {
+    const detail = conflicts.map((c) => `${c.framework} 属${c.shapes.join(" / ")}，与会话声明的形态（${args.project_stacks.join("、")}）没有交集`).join("；");
+    const shapes = [...new Set(conflicts.flatMap((c) => c.shapes))];
+    throw new Error(`project_frameworks 与会话声明的 project_stacks 矛盾：${detail}。
+` + `框架标签归属的形态由声明该标签的 skill 推导，不由本工具硬编码。
+` + `前后端同仓请把对应形态一并写进 project_stacks（${shapes.join(" / ")} 需在 project_stacks 中声明）。`);
+  }
 }
 async function resolveChangeDocContent(repoRoot, state, changeId, baseBranch, relPath) {
   if (state) {
     const item = state.workItems.find((w) => w.id === `task:${state.taskGroupId}`);
     const worktreePath = item && typeof item.metadata["worktree_path"] === "string" ? item.metadata["worktree_path"] : null;
     if (worktreePath) {
-      const p = path6.join(worktreePath, relPath);
+      const p = path5.join(worktreePath, relPath);
       if (await pathExists(p)) {
         try {
-          return await readFile5(p, "utf-8");
+          return await readFile6(p, "utf-8");
         } catch {}
       }
     }
   }
-  const mainPath = path6.join(repoRoot, relPath);
+  const mainPath = path5.join(repoRoot, relPath);
   if (await pathExists(mainPath)) {
     try {
-      return await readFile5(mainPath, "utf-8");
+      return await readFile6(mainPath, "utf-8");
     } catch {}
   }
   const shown = await runGitChecked(repoRoot, ["show", `${baseBranch}:${relPath}`]);
@@ -42781,12 +43749,22 @@ async function resolveChangeDocContent(repoRoot, state, changeId, baseBranch, re
   return null;
 }
 async function runGitignoreGuard(ctx, opts) {
-  return ensureGeneratedDirsIgnored(ctx.worktree, opts);
+  return ensureIgnoreBaseline(ctx.worktree, opts);
 }
 function withGitignoreGuard(guardNote, body) {
-  return `${body}
+  return guardNote.length > 0 ? `${body}
 
-${guardNote}`;
+${guardNote}` : body;
+}
+async function runProjectConfigGuard(ctx, session) {
+  const probe = await probeContainers(ctx.worktree);
+  return ensureProjectConfigsForSession(ctx.worktree, session, probe);
+}
+async function runBaselineGuards(ctx, ignoreOpts, session) {
+  const ignoreNote = await runGitignoreGuard(ctx, ignoreOpts);
+  const configNote = await runProjectConfigGuard(ctx, session);
+  return ignoreNote.length > 0 ? `${ignoreNote}
+${configNote}` : configNote;
 }
 async function initExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_init");
@@ -42805,18 +43783,14 @@ async function initExecute(params, ctx) {
   }
   assertValidRecovery(args.recovery);
   assertProjectStacks(args);
-  const guardNote = await runGitignoreGuard(ctx, {
-    baseBranch: args.review_scope?.scope_type === "pr" ? args.review_scope.head_ref ?? null : args.base_branch ?? null,
-    skipCommit: args.review_scope?.fix === "none"
-  });
   if (args.review_scope !== undefined) {
-    return withGitignoreGuard(guardNote, await initReviewSession(args, ctx));
+    return initReviewSession(args, ctx);
   }
   if (!args.change_id || !args.task_group_id) {
     if (args.change_id) {
       const existing = await readStateByChangeId(ctx.worktree, args.change_id);
       if (existing?.kind === "review") {
-        return withGitignoreGuard(guardNote, await initReviewRecovery(args, existing, ctx));
+        return initReviewRecovery(args, existing, ctx);
       }
     }
     throw new Error("初始化需要两种入口之一：change 会话传 change_id + task_group_id；独立审查会话传 review_scope（会话 id 由审查范围推导并在返回体回传）。两种入口互斥，不可同传或都不传。");
@@ -42861,6 +43835,15 @@ async function initExecute(params, ctx) {
   for (const g of parsedGroups) {
     tasksByGroup.set(g.id, parseTasksForGroupFromContent(tasksContent, g.id));
   }
+  const guardSession = state?.stacks ?? {
+    project_stacks: args.project_stacks,
+    project_frameworks: args.project_frameworks
+  };
+  const guardNote = await runBaselineGuards(ctx, {
+    baseBranch: args.base_branch ?? state?.baseBranch ?? null,
+    session: guardSession
+  }, guardSession);
+  const shapeWarnings = shapeCoverageWarnings(guardSession);
   const clarifyContent = await resolveChangeDocContent(ctx.worktree, state, changeId, fallbackBaseBranch, `openspec/changes/${changeId}/clarify.md`);
   const clarifyBoundary = clarifyContent === null ? null : parseExecutionBoundary(clarifyContent, args.task_group_id);
   let modeSwitchNote = null;
@@ -43027,6 +44010,12 @@ async function initExecute(params, ctx) {
 
 ⚠️ simple 模式无 review 子层（仅 quality_review 单层审查），recovery.review_layer 参数未生效。`);
   }
+  if (shapeWarnings.length > 0) {
+    parts.push(`
+
+⚠️ ${shapeWarnings.join(`
+⚠️ `)}`);
+  }
   return withGitignoreGuard(guardNote, parts.join(""));
 }
 async function bindReviewWorktreeRefs(item, worktreePath, branch, state) {
@@ -43068,7 +44057,7 @@ async function ensureChangeBranch(repoRoot, branch, baseBranch) {
 async function listFilesRecursive(root, prefix = "") {
   let entries = [];
   try {
-    entries = await readdir(path6.join(root, prefix), { withFileTypes: true });
+    entries = await readdir(path5.join(root, prefix), { withFileTypes: true });
   } catch {
     return [];
   }
@@ -43083,7 +44072,7 @@ async function listFilesRecursive(root, prefix = "") {
   return files;
 }
 async function sha256OfFile(filePath) {
-  return createHash2("sha256").update(await readFile5(filePath)).digest("hex");
+  return createHash2("sha256").update(await readFile6(filePath)).digest("hex");
 }
 async function removeEmptyDirs(root) {
   let entries = [];
@@ -43094,7 +44083,7 @@ async function removeEmptyDirs(root) {
   }
   for (const entry of entries) {
     if (entry.isDirectory())
-      await removeEmptyDirs(path6.join(root, entry.name));
+      await removeEmptyDirs(path5.join(root, entry.name));
   }
   try {
     await rmdir(root);
@@ -43149,13 +44138,13 @@ async function isSamePlanDocsAsBase(repoRoot, baseBranch, changeDir, basePaths, 
   if (basePaths.length !== localFiles.length)
     return false;
   const baseSet = new Set(basePaths);
-  const sourceDir = path6.join(repoRoot, changeDir);
+  const sourceDir = path5.join(repoRoot, changeDir);
   for (const rel of localFiles) {
     const relPath = `${changeDir}/${rel}`;
     if (!baseSet.has(relPath))
       return false;
     const baseOid = await blobOidInRef(repoRoot, baseBranch, relPath);
-    const localOid = await hashObjectOfFile(repoRoot, path6.join(sourceDir, rel));
+    const localOid = await hashObjectOfFile(repoRoot, path5.join(sourceDir, rel));
     if (baseOid !== localOid)
       return false;
   }
@@ -43164,7 +44153,7 @@ async function isSamePlanDocsAsBase(repoRoot, baseBranch, changeDir, basePaths, 
 async function resolveCrossBranchPlan(repoRoot, state, currentBranch) {
   const changeDir = `openspec/changes/${state.changeId}`;
   const basePaths = await listTreePaths(repoRoot, state.baseBranch, changeDir);
-  const sourceDir = path6.join(repoRoot, changeDir);
+  const sourceDir = path5.join(repoRoot, changeDir);
   const localFiles = await pathExists(sourceDir) ? await listFilesRecursive(sourceDir) : [];
   if (basePaths.length > 0) {
     if (localFiles.length === 0)
@@ -43196,7 +44185,7 @@ async function resolveCrossBranchPlan(repoRoot, state, currentBranch) {
 async function resolveDetachedPlan(repoRoot, state) {
   const changeDir = `openspec/changes/${state.changeId}`;
   const basePaths = await listTreePaths(repoRoot, state.baseBranch, changeDir);
-  const sourceDir = path6.join(repoRoot, changeDir);
+  const sourceDir = path5.join(repoRoot, changeDir);
   const localFiles = await pathExists(sourceDir) ? await listFilesRecursive(sourceDir) : [];
   if (basePaths.length > 0) {
     return { sync: false, skipNote: planDetachedOnBaseNote(state.baseBranch, changeDir, localFiles.length) };
@@ -43213,7 +44202,7 @@ async function resolveDetachedPlan(repoRoot, state) {
 }
 async function syncChangePlanDocs(repoRoot, worktreePath, state) {
   const changeDir = `openspec/changes/${state.changeId}`;
-  const sourceDir = path6.join(repoRoot, changeDir);
+  const sourceDir = path5.join(repoRoot, changeDir);
   if (!await pathExists(sourceDir))
     return "";
   const files = await listFilesRecursive(sourceDir);
@@ -43225,10 +44214,10 @@ async function syncChangePlanDocs(repoRoot, worktreePath, state) {
   }
   const hashes = new Map;
   for (const rel of files) {
-    const src = path6.join(sourceDir, rel);
-    const dst = path6.join(worktreePath, changeDir, rel);
+    const src = path5.join(sourceDir, rel);
+    const dst = path5.join(worktreePath, changeDir, rel);
     hashes.set(rel, await sha256OfFile(src));
-    await mkdir(path6.dirname(dst), { recursive: true });
+    await mkdir(path5.dirname(dst), { recursive: true });
     await copyFile(src, dst);
   }
   const addResult = await runGitChecked(worktreePath, ["add", "--", changeDir]);
@@ -43266,7 +44255,7 @@ async function syncChangePlanDocs(repoRoot, worktreePath, state) {
   }
   const changed = [];
   for (const rel of files) {
-    const src = path6.join(sourceDir, rel);
+    const src = path5.join(sourceDir, rel);
     if (!await pathExists(src) || await sha256OfFile(src) !== hashes.get(rel))
       changed.push(rel);
   }
@@ -43276,7 +44265,7 @@ async function syncChangePlanDocs(repoRoot, worktreePath, state) {
   }
   for (const rel of files) {
     try {
-      await rm2(path6.join(sourceDir, rel), { force: true });
+      await rm2(path5.join(sourceDir, rel), { force: true });
     } catch (e) {
       throw new Error(`主仓库规划文档副本删除失败（${rel}）：${e instanceof Error ? e.message : String(e)}。
 ` + `worktree 已提交、内容安全，请人工删除主仓库副本：\`rm -rf '${sourceDir}'\`。`);
@@ -43338,21 +44327,28 @@ async function ensureChangeWorktree(repoRoot, state, item, branch, defaultPath, 
 }
 async function setWorktreeExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_set_worktree");
-  const stateFileExists = existsSync5(getStatePath(ctx.worktree, params.change_id)) || existsSync5(path6.join(getLegacyStateDir(ctx.worktree), `${params.change_id}.json`));
+  const stateFileExists = existsSync9(getStatePath(ctx.worktree, params.change_id)) || existsSync9(path5.join(getLegacyStateDir(ctx.worktree), `${params.change_id}.json`));
   let preexisting = null;
   try {
-    const raw = await readFile5(getStatePath(ctx.worktree, params.change_id), "utf-8");
+    const raw = await readFile6(getStatePath(ctx.worktree, params.change_id), "utf-8");
     const parsed = JSON.parse(raw);
     preexisting = {
       baseBranch: parsed["baseBranch"],
       kind: parsed["kind"],
-      reviewScope: parsed["reviewScope"]
+      reviewScope: parsed["reviewScope"],
+      stacks: parsed["stacks"]
     };
   } catch {}
-  const guardNote = stateFileExists ? await ensureGeneratedDirsIgnored(ctx.worktree, {
+  const preexistingSession = Array.isArray(preexisting?.stacks?.project_stacks) && Array.isArray(preexisting?.stacks?.project_frameworks) ? {
+    project_stacks: preexisting.stacks.project_stacks,
+    project_frameworks: preexisting.stacks.project_frameworks
+  } : null;
+  const guardNote = stateFileExists ? await runBaselineGuards(ctx, {
     baseBranch: typeof preexisting?.baseBranch === "string" ? preexisting.baseBranch : null,
-    skipCommit: preexisting?.kind === "review" && preexisting.reviewScope?.fix === "none"
-  }) : "";
+    skipCommit: preexisting?.kind === "review" && preexisting.reviewScope?.fix === "none",
+    session: preexistingSession
+  }, preexistingSession) : "";
+  const stacksFallbackNote = stateFileExists && preexistingSession === null ? "- **旧布局提示**: 状态文件未记录会话项目栈（旧布局），本次只补框架级基线；能力级基线与项目级扫描配置需重新初始化会话后补齐。" : "";
   const state = await readStateByWorktree(ctx.worktree, params.change_id);
   if (!state)
     throw new Error("编排会话未初始化。请先调用 opx_orch_init。");
@@ -43379,7 +44375,7 @@ async function setWorktreeExecute(params, ctx) {
   if (params.worktree_path) {
     wtPath = assertPathWithin(repoRoot, params.worktree_path, "worktree_path");
   } else {
-    wtPath = isReview ? path6.join(repoRoot, ".worktree", state.changeId, "review") : path6.join(repoRoot, ".worktree", state.changeId, "ws");
+    wtPath = isReview ? path5.join(repoRoot, ".worktree", state.changeId, "review") : path5.join(repoRoot, ".worktree", state.changeId, "ws");
   }
   const currentBranch = isReview ? "" : (await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
   const detached = !isReview && (currentBranch === "" || currentBranch === "HEAD");
@@ -43476,7 +44472,8 @@ async function setWorktreeExecute(params, ctx) {
     `- **状态**: ${reused ? "复用已有 worktree" : "已创建 worktree"}`,
     `- **路径**: \`${item.metadata["worktree_path"]}\``,
     `- **分支**: \`${branch}\``,
-    ...planNote ? ["", planNote] : []
+    ...planNote ? ["", planNote] : [],
+    ...stacksFallbackNote ? ["", stacksFallbackNote] : []
   ].join(`
 `));
 }
@@ -43524,10 +44521,10 @@ async function statusExecute(params, ctx) {
   return renderWorkflowStatusView(item, workflow, rec, { agent, orchestrator: ctx.orchestrator, identityDeclared: ctx.identityDeclared }, { state, tg, mainPollution, toolChanges, exemptedHits, exemptionItems });
 }
 async function sweepEmptyWorktreeParents(repoRoot, removedDir, changeId) {
-  const repoRootAbs = path6.resolve(repoRoot);
-  const groupLevelDir = path6.join(repoRootAbs, ".worktree", changeId);
-  const worktreeLevelDir = path6.join(repoRootAbs, ".worktree");
-  if (path6.dirname(path6.resolve(removedDir)) === groupLevelDir) {
+  const repoRootAbs = path5.resolve(repoRoot);
+  const groupLevelDir = path5.join(repoRootAbs, ".worktree", changeId);
+  const worktreeLevelDir = path5.join(repoRootAbs, ".worktree");
+  if (path5.dirname(path5.resolve(removedDir)) === groupLevelDir) {
     try {
       await rmdir(groupLevelDir);
     } catch {}
@@ -43964,12 +44961,16 @@ function buildIssueChild(nc, sourceAgent) {
   child.metadata["dimension"] = sourceDim ?? nc.dimension;
   if (nc.file)
     child.metadata["file"] = nc.file;
+  if (nc.path_pattern)
+    child.metadata["path_pattern"] = nc.path_pattern;
   if (nc.line !== undefined)
     child.metadata["line"] = nc.line;
   if (nc.suggestion)
     child.metadata["suggestion"] = nc.suggestion;
   if (nc.rule)
     child.metadata["rule"] = nc.rule;
+  if (nc.rule_keys && nc.rule_keys.length > 0)
+    child.metadata["rule_keys"] = nc.rule_keys;
   if (nc.root_cause_guess)
     child.metadata["root_cause_guess"] = nc.root_cause_guess;
   return child;
@@ -44326,6 +45327,17 @@ async function agentSubmitExecute(params, ctx) {
       }
       if (!nc.description || !nc.description.trim()) {
         throw new Error(`new_children 中 issue "${nc.id}" 的 description 不能为空。`);
+      }
+      if (nc.path_pattern !== undefined && !nc.path_pattern.trim()) {
+        throw new Error(`new_children 中 issue "${nc.id}" 的 path_pattern 不能为空。表达一类路径时给出路径 glob（如 src/generated/**）；精确单文件用 file。`);
+      }
+      if (nc.rule_keys !== undefined) {
+        if (nc.rule_keys.length === 0) {
+          throw new Error(`new_children 中 issue "${nc.id}" 的 rule_keys 不能为空数组。表达一组规则时至少给出一个规则键；单条规则用 rule。`);
+        }
+        if (nc.rule_keys.some((k) => !k || !k.trim())) {
+          throw new Error(`new_children 中 issue "${nc.id}" 的 rule_keys 含空规则键，请填写有效规则键。`);
+        }
       }
       if (sourceDim) {
         if (nc.dimension !== undefined) {
@@ -44737,10 +45749,25 @@ var newChildIssueItem = {
       enum: CODE_DIMENSIONS,
       description: "issue 归因维度：quality reviewer 报 issue 时由报源自动推断、无需填写（显式填写须与报源维度一致）；tool/task reviewer 报 issue 时必须显式填写"
     },
-    file: { type: "string", description: "问题所在文件路径（相对于 worktree）" },
+    file: {
+      type: "string",
+      description: "问题所在文件路径（相对于 worktree），用于精确到单个文件；问题覆盖一类路径时用 path_pattern，二者可同时给出"
+    },
+    path_pattern: {
+      type: "string",
+      description: "路径 glob（如 src/generated/**），用于表达「这一类路径」；精确单文件用 file，二者可同时给出"
+    },
     line: { type: "integer", minimum: 0, description: "问题所在行号（0=整文件/待新建文件）" },
     suggestion: { type: "string", description: "修复建议" },
-    rule: { type: "string", description: "工具规则名（如 PMD Rule / SonarQube rule），无则省略" },
+    rule: {
+      type: "string",
+      description: "单条规则键（规则标识），无则省略；表达一组规则时用 rule_keys，二者可同时给出"
+    },
+    rule_keys: {
+      type: "array",
+      items: { type: "string", minLength: 1 },
+      description: "一组规则键，用于表达「这一组规则」；单条规则用 rule，二者可同时给出"
+    },
     root_cause_guess: { type: "string", description: "根因猜测（仅特定维度需要）" }
   },
   required: ["id", "title", "description"],
@@ -44790,13 +45817,13 @@ var orchInitSchema = {
     recovery: recoverySchema,
     project_stacks: {
       type: "array",
-      description: "项目形态栈（必传，两入口均需）：每个值必须是当前 skill 索引中某个 skill frontmatter 声明的 stacks 标签（动态校验，无硬编码值域），否则拒绝执行。存入编排会话状态，作为 skill 加载清单过滤与 must_do 门禁的形态过滤基准。",
+      description: "项目形态栈（必传，两入口均需）：每个值必须是当前 skill 索引中某个 skill frontmatter 声明的 stacks 标签（动态校验，无硬编码值域），否则拒绝执行。按项目实际形态声明：前后端同仓时把前后端形态都写进本字段。存入编排会话状态，作为 skill 加载清单过滤、忽略基线与 must_do 门禁的形态过滤基准。",
       items: { type: "string", minLength: 1 },
       minItems: 1
     },
     project_frameworks: {
       type: "array",
-      description: "项目框架栈（必传，两入口均需）：每个值必须是当前 skill 索引中某个 skill frontmatter 声明的 frameworks 标签（动态校验，无硬编码值域），否则拒绝执行。存入编排会话状态，作为 skill 加载清单过滤与 must_do 门禁的框架过滤基准。",
+      description: "项目框架栈（必传，两入口均需）：每个值必须是当前 skill 索引中某个 skill frontmatter 声明的 frameworks 标签（动态校验，无硬编码值域），否则拒绝执行。按项目实际框架声明并取并集：前后端同仓时把两端框架都写进本字段，且须与 project_stacks 声明的形态对应。存入编排会话状态，作为 skill 加载清单过滤、忽略基线与 must_do 门禁的框架过滤基准。",
       items: { type: "string", minLength: 1 },
       minItems: 1
     },
@@ -44978,12 +46005,12 @@ var agentSubmitSchema = {
 var OPX_TOOL_SPECS = [
   {
     name: "opx_orch_init",
-    description: "编排前自动确保目标项目根 .gitignore 明确覆盖插件生成的目录并原子提交（缺条目只追加补齐、以仅含 .gitignore 一处变更的独立 commit 提交；无法安全提交时只写工作树使其生效）。初始化编排会话。project_stacks 与 project_frameworks 必传（change 入口与 review_scope 独立审查入口均需要）：声明项目形态栈与框架栈，每个值须命中当前 skill 索引中 skill frontmatter 声明的 stacks / frameworks 标签（动态校验，无硬编码值域），作为 skill 加载清单过滤与 step 必做清单分组的过滤基准，与 change_id 同生命周期持久化（recovery 恢复时同样必传）。传入变更 ID 和任务组 ID，工具自动解析 tasks.md 提取全部任务组并解析目标组子任务，同时自动从 clarify.md 解析当前任务组执行边界写入状态，缺失时按整个 worktree 处理。可通过 recovery 参数恢复到指定阶段。无 recovery 重复初始化当前任务组时保留其阶段和进度；切换到其它任务组时初始化该组。可选 mode 参数（full/simple，缺省 simple）选择流程模式：full=完整流程（implement→三重审查+收尾验证，analyze 仅作 implement 上报 blocker 后的裁决回退落点）；simple=精简流程（implement→quality_review→done，不走 blocker 状态机）。首次新建状态时固化；已开始的变更仅切组（其他任务组均已完成或从未激活）或 recovery.phase=task_analysis 重制当前组（其他任务组同样须已完成或从未激活）时可更新，其余场景传不同 mode 报错。",
+    description: "按会话声明的形态补齐技术栈忽略基线（`.gitignore` / `.prettierignore`），编排产物强制覆盖；无法安全提交时只写工作树并说明。同时按本地容器探测结果补齐项目级扫描平台配置：缺失时按模板创建、已存在时只补缺失键，只写工作树不提交，探测不到则跳过。初始化编排会话。project_stacks 与 project_frameworks 必传（change 入口与 review_scope 独立审查入口均需要）：声明项目形态栈与框架栈，每个值须命中当前 skill 索引中 skill frontmatter 声明的 stacks / frameworks 标签（动态校验，无硬编码值域），作为 skill 加载清单过滤与 step 必做清单分组的过滤基准，与 change_id 同生命周期持久化（recovery 恢复时同样必传）。传入变更 ID 和任务组 ID，工具自动解析 tasks.md 提取全部任务组并解析目标组子任务，同时自动从 clarify.md 解析当前任务组执行边界写入状态，缺失时按整个 worktree 处理。可通过 recovery 参数恢复到指定阶段。无 recovery 重复初始化当前任务组时保留其阶段和进度；切换到其它任务组时初始化该组。可选 mode 参数（full/simple，缺省 simple）选择流程模式：full=完整流程（implement→三重审查+收尾验证，analyze 仅作 implement 上报 blocker 后的裁决回退落点）；simple=精简流程（implement→quality_review→done，不走 blocker 状态机）。首次新建状态时固化；已开始的变更仅切组（其他任务组均已完成或从未激活）或 recovery.phase=task_analysis 重制当前组（其他任务组同样须已完成或从未激活）时可更新，其余场景传不同 mode 报错。",
     schema: orchInitSchema
   },
   {
     name: "opx_orch_set_worktree",
-    description: "编排前自动确保目标项目根 .gitignore 明确覆盖插件生成的目录并原子提交（缺条目只追加补齐、以仅含 .gitignore 一处变更的独立 commit 提交；无法安全提交时只写工作树使其生效）。确保目标组的 git worktree 就绪。change 会话按 change 模型 create-or-reuse：分支 change/{changeId} 不存在时从基准分支 tip 创建，worktree 常驻于 .worktree/{changeId}/ws，全部任务组串行复用（复用校验：目录缺失自愈重建、openspec 文档脏自动提交、代码文件脏拒绝）。只补齐资源，不改变阶段。",
+    description: "按会话声明的形态补齐技术栈忽略基线（`.gitignore` / `.prettierignore`），编排产物强制覆盖；无法安全提交时只写工作树并说明。同时按本地容器探测结果补齐项目级扫描平台配置：缺失时按模板创建、已存在时只补缺失键，只写工作树不提交，探测不到则跳过。确保目标组的 git worktree 就绪。change 会话按 change 模型 create-or-reuse：分支 change/{changeId} 不存在时从基准分支 tip 创建，worktree 常驻于 .worktree/{changeId}/ws，全部任务组串行复用（复用校验：目录缺失自愈重建、openspec 文档脏自动提交、代码文件脏拒绝）。只补齐资源，不改变阶段。",
     schema: setWorktreeSchema
   },
   {
@@ -45049,7 +46076,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "1.8.0";
+var PKG_VERSION = "1.9.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
@@ -45078,7 +46105,7 @@ function buildMcpServer(worktree, opts = {}) {
 // src/adapters/mcp-common/index.ts
 import { createServer as createServer2 } from "node:http";
 import { randomUUID } from "node:crypto";
-import { join as join4 } from "node:path";
+import { join as join9 } from "node:path";
 
 // node_modules/@hono/node-server/dist/constants-BLSFu_RU.mjs
 var X_ALREADY_SENT = "x-hono-already-sent";
@@ -45583,7 +46610,7 @@ var readBodyDirect = (request) => {
     request[bodyBufferKey] = buffered;
     return Promise.resolve(buffered);
   }
-  const promise3 = new Promise((resolve3, reject) => {
+  const promise3 = new Promise((resolve4, reject) => {
     const chunks = [];
     let settled = false;
     const finish = (callback) => {
@@ -45605,7 +46632,7 @@ var readBodyDirect = (request) => {
           reject(error62 ?? normalizeAbortError(request, incoming));
         else {
           request[bodyBufferKey] = recovered;
-          resolve3(recovered);
+          resolve4(recovered);
         }
       });
       return true;
@@ -45617,7 +46644,7 @@ var readBodyDirect = (request) => {
       finish(() => {
         const buffer = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
         request[bodyBufferKey] = buffer;
-        resolve3(buffer);
+        resolve4(buffer);
       });
     };
     const onError = (error62) => {
@@ -46234,7 +47261,7 @@ var responseViaResponseObject = async (res, outgoing, options = {}) => {
         });
         if (!chunk) {
           if (i === 1) {
-            await new Promise((resolve3) => setTimeout(resolve3));
+            await new Promise((resolve4) => setTimeout(resolve4));
             maxReadCount = 3;
             continue;
           }
@@ -46956,9 +47983,9 @@ data:
       const initRequest = messages.find((m) => isInitializeRequest(m));
       const clientProtocolVersion = initRequest ? initRequest.params.protocolVersion : req.headers.get("mcp-protocol-version") ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION;
       if (this._enableJsonResponse) {
-        return new Promise((resolve3) => {
+        return new Promise((resolve4) => {
           this._streamMapping.set(streamId, {
-            resolveJson: resolve3,
+            resolveJson: resolve4,
             cleanup: () => {
               this._streamMapping.delete(streamId);
             }
@@ -47275,8 +48302,8 @@ class StreamableHTTPServerTransport {
   }
 }
 // src/core/workflow/collector.ts
-import { readdirSync as readdirSync4, readFileSync as readFileSync5 } from "node:fs";
-import { join as join3 } from "node:path";
+import { readdirSync as readdirSync7, readFileSync as readFileSync8 } from "node:fs";
+import { join as join8 } from "node:path";
 var DEFAULT_POLL_INTERVAL_MS = 30000;
 var SOURCE = "openspec";
 var CHANGE_LABEL = "openspec-change";
@@ -47310,10 +48337,10 @@ class OpenSpecCollector {
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   }
   async pull() {
-    const changesDir = join3(this.openspecDir, "changes");
+    const changesDir = join8(this.openspecDir, "changes");
     let entries;
     try {
-      entries = readdirSync4(changesDir, { withFileTypes: true });
+      entries = readdirSync7(changesDir, { withFileTypes: true });
     } catch {
       return [];
     }
@@ -47322,7 +48349,7 @@ class OpenSpecCollector {
       if (!entry.isDirectory())
         continue;
       try {
-        const proposalText = readFileSync5(join3(changesDir, entry.name, "proposal.md"), "utf8");
+        const proposalText = readFileSync8(join8(changesDir, entry.name, "proposal.md"), "utf8");
         refs.push({ changeName: entry.name, proposalText });
       } catch {
         continue;
@@ -47464,7 +48491,7 @@ var DEFAULT_PORT = 4525;
 var MAX_PORT_ATTEMPTS = 20;
 function startSideEffects(worktree) {
   try {
-    registerCollector(new OpenSpecCollector({ openspecDir: join4(worktree, "openspec") }));
+    registerCollector(new OpenSpecCollector({ openspecDir: join9(worktree, "openspec") }));
     registerCollector(new AdoCollector);
     readContextFromWorktree(worktree).then((ctx) => {
       if (ctx?.changeId && ctx?.taskGroupId) {
@@ -47514,16 +48541,16 @@ async function startMcpServer(opts) {
   let started = false;
   for (let p = port;p < port + MAX_PORT_ATTEMPTS; p++) {
     try {
-      await new Promise((resolve3, reject) => {
+      await new Promise((resolve4, reject) => {
         server.once("error", (err) => {
           if (err.code === "EADDRINUSE") {
             reject(err);
           } else {
             console.error("[mcp]", err.message);
-            resolve3();
+            resolve4();
           }
         });
-        server.listen(p, hostname3, () => resolve3());
+        server.listen(p, hostname3, () => resolve4());
       });
       started = true;
       console.log(`[mcp] openspec-agents MCP server http://${hostname3}:${p}/mcp（worktree: ${opts.worktree}）`);
@@ -47541,7 +48568,7 @@ async function startMcpServer(opts) {
 }
 
 // src/adapters/mcp-common/cli.ts
-import { fileURLToPath as fileURLToPath3 } from "node:url";
+import { fileURLToPath as fileURLToPath4 } from "node:url";
 import { realpathSync } from "node:fs";
 function parseArgs(argv) {
   const args = new Map;
@@ -47577,7 +48604,7 @@ async function main(argv) {
   startMcpServer(opts);
 }
 try {
-  if (realpathSync(fileURLToPath3(import.meta.url)) === realpathSync(process.argv[1] ?? "")) {
+  if (realpathSync(fileURLToPath4(import.meta.url)) === realpathSync(process.argv[1] ?? "")) {
     main(process.argv.slice(2));
   }
 } catch {}
