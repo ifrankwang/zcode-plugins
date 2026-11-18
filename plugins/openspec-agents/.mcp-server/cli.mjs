@@ -37936,22 +37936,18 @@ async function writeDismissedExemption(worktree, child, opts) {
     console.warn(`[exemptions] 项目级豁免清单写入失败（不影响裁定主流程）：${err.message}`);
   }
 }
-function applyExemptionDowngrade(children, store) {
-  let downgraded = 0;
+function applyExemptionSuppression(children, store) {
+  const kept = [];
+  const suppressed = [];
   for (const c of children) {
     const target = exemptionTargetOfChild(c);
     const hit = store.items.find((record3) => matchesExemption(target, record3));
-    if (hit) {
-      const label = hit.rule ?? normalizeRuleKeys(hit.ruleKeys).join(",");
-      c.severity = "Info";
-      c.metadata[EXEMPTED_HIT_KEY] = label !== "" ? label : true;
-      c.description = `${c.description}
-
-> 命中项目级豁免清单${label ? `（rule=${label}）` : ""}，保持现状。`;
-      downgraded++;
-    }
+    if (hit)
+      suppressed.push(c);
+    else
+      kept.push(c);
   }
-  return downgraded;
+  return { kept, suppressed };
 }
 
 // src/core/tasks-md.ts
@@ -42611,14 +42607,14 @@ function renderAgentWorking(item, rec, step, common2, ctxAgent, state, tg, mustD
 `);
   }
   const mustDoItems = resolveStepMustDo(step ?? undefined, state.stacks ?? null);
-  const suppressionLines = mustDoItems.includes("config_check") ? renderSuppressionConsistencySection(tg.worktreePath, state.stacks ?? null, exemptionItems) : [];
+  const exemptionSection = buildExemptionSectionContext(item, tg, state, mustDoItems.includes("config_check"), toolChanges, exemptionItems, exemptedHits);
   if (step?.id === "verify_tool" && agentToReviewLayer(ctxAgent) === "tool" && toolChanges && !toolChanges.scopeFull) {
     const { active, pending } = toolPendingChildren(item, ctxAgent);
     if (!toolChanges.hasNonDocChange && active.length === 0 && pending.length === 0) {
-      return renderToolDirectSubmit(exemptedHits, suppressionLines);
+      return renderToolDirectSubmit(exemptionSection);
     }
     if (!toolChanges.hasNonDocChange) {
-      return renderToolAdjudicateOnly(item, rec, ctxAgent, exemptedHits, exemptionCtx, suppressionLines);
+      return renderToolAdjudicateOnly(item, rec, ctxAgent, exemptionCtx, exemptionSection);
     }
   }
   const caps = step?.agents.find((a) => a.id === ctxAgent)?.capability_tags ?? [];
@@ -42651,12 +42647,8 @@ function renderAgentWorking(item, rec, step, common2, ctxAgent, state, tg, mustD
     `**阶段**: ${item.phase} | **step**: \`${rec.stepId ?? "(无)"}\``,
     ""
   ];
-  if ((exemptedHits ?? 0) > 0) {
-    lines.push(`> **存量豁免提示**：本 change 存在 ${exemptedHits} 个命中项目级跨 change 豁免清单的存量问题（已按 Info 处理，不阻塞、无需重复豁免）。`, "");
-  }
   lines.push(...renderStepSemantics(step, common2, stepCtx));
   lines.push(...renderMustDoChecklist(mustDoItems, mustDoCatalog, rec.stepId));
-  lines.push(...suppressionLines);
   lines.push(...renderWorktreeSection(state, tg, { showNamespace: true, showPort: true }));
   if (step?.id === "verify_tool" && agentToReviewLayer(ctxAgent) === "tool" && toolChanges?.hasNonDocChange) {
     lines.push(...renderToolChangesEvidence(item, tg, toolChanges, "tool_review"));
@@ -42668,7 +42660,7 @@ function renderAgentWorking(item, rec, step, common2, ctxAgent, state, tg, mustD
     lines.push(...renderDevMustDoDeclaration(item.metadata));
   }
   lines.push(...renderAgentSummaries(readAgentSummaries(item), ctxAgent));
-  lines.push(...renderStepContext(item, step, ctxAgent, state, exemptionCtx));
+  lines.push(...renderStepContext(item, step, ctxAgent, state, exemptionCtx, exemptionSection));
   lines.push(...renderSkillSuggestions(ctxAgent, caps, state.stacks ?? null));
   lines.push("## 操作指引", "");
   let n = 0;
@@ -42738,7 +42730,7 @@ var STEP_ID_TO_CONTEXT_KIND = {
 function stepContextKind(stepId) {
   return STEP_ID_TO_CONTEXT_KIND[stepId];
 }
-function renderStepContext(item, step, ctxAgent, state, exemptionCtx) {
+function renderStepContext(item, step, ctxAgent, state, exemptionCtx, exemptionSection) {
   if (!step)
     return [];
   const lines = [];
@@ -42752,16 +42744,16 @@ function renderStepContext(item, step, ctxAgent, state, exemptionCtx) {
       lines.push(...renderDeveloperChildren(item, ctxAgent, exemptionCtx));
       break;
     case "review_tool":
-      lines.push(...renderToolChildren(item, ctxAgent, exemptionCtx));
+      lines.push(...renderToolChildren(item, ctxAgent, exemptionCtx, exemptionSection));
       break;
     case "review_task":
       lines.push(...renderTaskChildren(item, ctxAgent, exemptionCtx));
       break;
     case "review_quality":
-      lines.push(...renderQualityChildren(item, ctxAgent, exemptionCtx));
+      lines.push(...renderQualityChildren(item, ctxAgent, exemptionCtx, exemptionSection));
       break;
     case "review_merged":
-      lines.push(...renderMergedChildren(item, ctxAgent, exemptionCtx));
+      lines.push(...renderMergedChildren(item, ctxAgent, exemptionCtx, exemptionSection));
       break;
     case "review_cleanup":
       lines.push(...renderCleanupChildren(item, ctxAgent, exemptionCtx));
@@ -42901,11 +42893,12 @@ function toolPendingChildren(item, ctxAgent) {
     pending: issues.filter((c) => isToolAdjudicable(c))
   };
 }
-function renderToolChildren(item, ctxAgent, exemptionCtx) {
+function renderToolChildren(item, ctxAgent, exemptionCtx, exemptionSection) {
   const { active, pending } = toolPendingChildren(item, ctxAgent);
   const lines = [];
   lines.push(...renderChildrenSection("Issue (待复核)", active, exemptionCtx));
   lines.push(...renderChildrenSection("Issue (待裁定是否可豁免)", pending, exemptionCtx));
+  lines.push(...renderExemptionSection(exemptionSection, { list: true, consistency: true }));
   return lines;
 }
 var EVIDENCE_KIND_LABELS = {
@@ -42946,16 +42939,123 @@ function renderToolChangesEvidence(item, tg, toolChanges, kind) {
   lines.push("");
   return lines;
 }
-function renderSuppressionConsistencySection(repoRoot, session, exemptionItems) {
-  if (!repoRoot)
+var EXEMPTION_LIST_LIMIT = 50;
+var STOCK_EXEMPTION_NOTE = "历史存量，未参与本轮判定";
+function readSuppressedExemptions(item) {
+  const raw = item.metadata["exemption_suppressed"];
+  if (!Array.isArray(raw))
     return [];
-  const lines = ["## 配置忽略与豁免一致性", ""];
+  return raw.filter((e) => typeof e === "object" && e !== null);
+}
+function countStockExemptions(item) {
+  return item.children.filter((c) => c.type === "issue" && c.metadata[EXEMPTED_HIT_KEY] !== undefined).length;
+}
+function buildExemptionSectionContext(item, tg, state, consistencyEnabled, toolChanges, exemptionItems, exemptedHits) {
+  return {
+    items: exemptionItems ?? [],
+    toolChanges,
+    suppressed: readSuppressedExemptions(item),
+    stockCount: exemptedHits ?? countStockExemptions(item),
+    repoRoot: tg.worktreePath ?? null,
+    stacks: state.stacks ?? null,
+    consistencyEnabled
+  };
+}
+function renderExemptionSection(ctx, opts = {}) {
+  if (!ctx)
+    return [];
+  const body = [];
+  if (opts.list)
+    body.push(...renderExemptionListSegment(ctx));
+  body.push(...renderSuppressedSegment(ctx));
+  if (opts.consistency) {
+    const consistency = renderConsistencySegment(ctx);
+    if (consistency.length > 0)
+      body.push("### 配置一致性核对", "", ...consistency);
+  }
+  if (body.length === 0)
+    return [];
+  return ["## 豁免与抑制", "", ...body];
+}
+function renderExemptionListSegment(ctx) {
+  const total = ctx.items.length;
+  if (total === 0)
+    return [];
+  const lines = ["### 已豁免清单（命中以下条目不要再提报）", ""];
+  const changes = ctx.toolChanges;
+  if (!changes) {
+    lines.push(`- 项目级跨 change 豁免清单共 ${total} 条（本次未预计算变更检测结果，不展示明细）。`, "");
+    return lines;
+  }
+  if (changes.scopeFull) {
+    lines.push(`- 全量代码库审查：项目级跨 change 豁免清单共 ${total} 条。`, "");
+    for (const record3 of ctx.items.slice(0, EXEMPTION_LIST_LIMIT))
+      lines.push(renderExemptionListLine(record3));
+    lines.push(...renderExemptionTruncation(total));
+    return lines;
+  }
+  if (changes.files.length === 0) {
+    lines.push(`- 本次未检出变更文件：项目级跨 change 豁免清单共 ${total} 条，不展开明细。`, "");
+    return lines;
+  }
+  const matched = ctx.items.filter((record3) => exemptionCoversFiles(record3, changes.files));
+  lines.push(`- 与本次变更文件相关的豁免条目共 ${matched.length} 条（清单总计 ${total} 条）。`, "");
+  if (matched.length === 0)
+    return lines;
+  for (const record3 of matched.slice(0, EXEMPTION_LIST_LIMIT))
+    lines.push(renderExemptionListLine(record3));
+  lines.push(...renderExemptionTruncation(matched.length));
+  return lines;
+}
+function exemptionCoversFiles(record3, files) {
+  const pattern = record3.pathPattern;
+  if (pattern)
+    return files.some((f) => pathMatchesGlob(pattern, f));
+  if (record3.file)
+    return files.some((f) => f === record3.file);
+  return true;
+}
+function renderExemptionListLine(record3) {
+  const location = record3.pathPattern ? `\`${record3.pathPattern}\`（路径模式）` : record3.file ? `\`${record3.line !== undefined && record3.line > 0 ? `${record3.file}:${record3.line}` : record3.file}\`` : "（无路径限定）";
+  const rule = record3.rule ?? (record3.ruleKeys && record3.ruleKeys.length > 0 ? record3.ruleKeys.join(",") : "（无规则名）");
+  return `- ${location} | ${rule} | ${record3.severity || "Info"} | ${record3.description}`;
+}
+function renderExemptionTruncation(total) {
+  if (total <= EXEMPTION_LIST_LIMIT)
+    return [""];
+  return [`> 已截断，共 ${total} 条（仅列出前 ${EXEMPTION_LIST_LIMIT} 条）。`, ""];
+}
+function renderSuppressedSegment(ctx) {
+  const lines = [];
+  if (ctx.suppressed.length > 0) {
+    const autoSettled = ctx.suppressed.every((e) => e.verdict === "passed_auto");
+    lines.push("### 本轮已抑制", "");
+    lines.push(`以下 ${ctx.suppressed.length} 条提报命中「已豁免清单」，已抑制、不入库：`, "");
+    for (const entry of ctx.suppressed) {
+      const location = entry.file ? `（\`${entry.line !== undefined && entry.line > 0 ? `${entry.file}:${entry.line}` : entry.file}\`）` : "";
+      const rule = entry.rule ? ` | ${entry.rule}` : "";
+      lines.push(`- [${entry.severity || "Info"}] ${entry.description}${location}${rule}`);
+    }
+    if (autoSettled)
+      lines.push("", "> 本轮无剩余问题，已按通过收口。");
+    lines.push("");
+  }
+  if (ctx.stockCount > 0) {
+    lines.push(`> 历史存量 ${ctx.stockCount} 条：仍带 \`${EXEMPTED_HIT_KEY}\` 标记的存量 issue（${STOCK_EXEMPTION_NOTE}）。`, "");
+  }
+  return lines;
+}
+function renderConsistencySegment(ctx) {
+  if (!ctx.consistencyEnabled || !ctx.repoRoot)
+    return [];
+  const lines = [];
+  const session = ctx.stacks;
   if (!session || session.project_stacks.length === 0) {
     lines.push("未核对（会话未固化项目栈）。", "");
     return lines;
   }
-  const { entries, skippedDeclarations } = collectSuppressionSnapshot(repoRoot, session);
-  const { unmatchedConfig, unmatchedExemptions } = checkSuppressionConsistency(entries, exemptionItems ?? []);
+  const { entries, skippedDeclarations } = collectSuppressionSnapshot(ctx.repoRoot, session);
+  const { unmatchedConfig, unmatchedExemptions } = checkSuppressionConsistency(entries, ctx.items);
   const skipLine = skippedDeclarations > 0 ? `已跳过 ${skippedDeclarations} 条未识别声明（format 不在枚举、缺 key 或非数组）。` : "";
   if (unmatchedConfig.length === 0 && unmatchedExemptions.length === 0) {
     if (entries.length === 0 && skipLine !== "") {
@@ -42992,35 +43092,28 @@ function renderSuppressionConsistencySection(repoRoot, session, exemptionItems) 
   }
   return lines;
 }
-function renderToolDirectSubmit(exemptedHits, suppressionLines = []) {
+function renderToolDirectSubmit(exemptionSection) {
   const lines = [
     "# ✅ 当前轮到你执行",
     "",
     "自上次工具检查后，worktree 无代码/配置变更（仅 openspec 文档变更或无变更），本层亦无待复核/待裁定 issue。",
     ""
   ];
-  if ((exemptedHits ?? 0) > 0) {
-    lines.push(`> **存量豁免提示**：本 change 存在 ${exemptedHits} 个命中项目级跨 change 豁免清单的存量问题（已按 Info 处理，不阻塞、无需重复豁免）。`, "");
-  }
   lines.push("无需运行全量工具检查。", "");
-  lines.push(...suppressionLines);
+  lines.push(...renderExemptionSection(exemptionSection, { consistency: true }));
   lines.push("## 操作指引", "", "1. 提交前须申报本轮必做清单处理结果：以一条 `step` 名首段为 `no_change` 的 `must_do_checks` 条目声明本轮整体豁免必做清单（completed=false，并附结构化 skip_reason 注明判定依据），或按视图「本 step 必做清单」逐项申报（completed=true 附执行结果；无法执行项置 completed=false + 结构化 skip_reason）", `2. 结构化 skip_reason 格式：\`${SKIP_REASON_FORMAT}\``, `3. 调用 \`opx_agent_submit({ step_id: "verify_tool", verdict: "passed", must_do_checks: <必做清单申报结果> })\` 提交通过后结束会话。`, "");
   return lines.join(`
 `);
 }
-function renderToolAdjudicateOnly(item, rec, ctxAgent, exemptedHits, exemptionCtx, suppressionLines = []) {
+function renderToolAdjudicateOnly(item, rec, ctxAgent, exemptionCtx, exemptionSection) {
   const lines = [
     "# ✅ 当前轮到你执行",
     "",
     "自上次工具检查后，worktree 无代码/配置变更，无需运行全量工具检查。",
     ""
   ];
-  if ((exemptedHits ?? 0) > 0) {
-    lines.push(`> **存量豁免提示**：本 change 存在 ${exemptedHits} 个命中项目级跨 change 豁免清单的存量问题（已按 Info 处理，不阻塞、无需重复豁免）。`, "");
-  }
   lines.push("仅处理以下本层待复核 / 待裁定项，处理完成后提交：", "");
-  lines.push(...renderToolChildren(item, ctxAgent, exemptionCtx));
-  lines.push(...suppressionLines);
+  lines.push(...renderToolChildren(item, ctxAgent, exemptionCtx, exemptionSection));
   lines.push("## 操作指引", "");
   lines.push("1. 逐项复核/裁定上方各项：待复核 issue 经 `recheck_adjudications` 复核（通过置 done、不通过驳回并附驳回原因）；待裁定豁免经 `exempt_adjudications` 裁定（dismissed/rejected）");
   lines.push("2. 提交前须申报本轮必做清单处理结果：以一条 `step` 名首段为 `no_change` 的 `must_do_checks` 条目声明本轮整体豁免必做清单（completed=false + 结构化 skip_reason 注明判定依据），或按视图「本 step 必做清单」逐项申报");
@@ -43062,7 +43155,7 @@ function renderTaskChildren(item, ctxAgent, exemptionCtx) {
   lines.push(...renderChildrenSection("Issue (待裁定是否可豁免)", pending, exemptionCtx));
   return lines;
 }
-function renderQualityChildren(item, ctxAgent, exemptionCtx) {
+function renderQualityChildren(item, ctxAgent, exemptionCtx, exemptionSection) {
   const dimension = agentToDimension(ctxAgent);
   if (!dimension)
     return [];
@@ -43072,9 +43165,10 @@ function renderQualityChildren(item, ctxAgent, exemptionCtx) {
   lines.push(...renderChildrenSection("Issue (待复核)", own2, exemptionCtx));
   const pending = issues.filter((c) => isQualityAdjudicable(c, dimension, ctxAgent));
   lines.push(...renderChildrenSection("Issue (待裁定是否可豁免)", pending, exemptionCtx));
+  lines.push(...renderExemptionSection(exemptionSection, { list: false, consistency: false }));
   return lines;
 }
-function renderMergedChildren(item, ctxAgent, exemptionCtx) {
+function renderMergedChildren(item, ctxAgent, exemptionCtx, exemptionSection) {
   const lines = [];
   const pendingTasks = readTasks(item).filter((t) => t.status === "submitted");
   if (pendingTasks.length > 0) {
@@ -43089,6 +43183,7 @@ function renderMergedChildren(item, ctxAgent, exemptionCtx) {
   lines.push(...renderChildrenSection("Issue (待复核)", own2, exemptionCtx));
   const pending = issues.filter((c) => isQualityAdjudicable(c, agentToDimension(ctxAgent), ctxAgent));
   lines.push(...renderChildrenSection("Issue (待裁定是否可豁免)", pending, exemptionCtx));
+  lines.push(...renderExemptionSection(exemptionSection, { list: true, consistency: true }));
   return lines;
 }
 function renderCleanupChildren(item, ctxAgent, exemptionCtx) {
@@ -43151,7 +43246,7 @@ function renderChildIssue(child, exemptionCtx) {
   appendExemptionHints(lines, child, f, exemptionCtx);
   if (child.metadata[EXEMPTED_HIT_KEY] !== undefined) {
     const rule2 = typeof child.metadata[EXEMPTED_HIT_KEY] === "string" ? child.metadata[EXEMPTED_HIT_KEY] : "";
-    lines.push(`  - ⚠️ 命中项目级豁免清单${rule2 ? `（rule=${rule2}）` : ""}的存量问题，已按 Info 处理，无需重复豁免`);
+    lines.push(`  - ⚠️ ${STOCK_EXEMPTION_NOTE}（命中项目级豁免清单${rule2 ? ` rule=${rule2}` : ""}）`);
   }
   if (typeof child.metadata["suggestion"] === "string")
     lines.push(`  - 建议：${child.metadata["suggestion"]}`);
@@ -45358,6 +45453,11 @@ async function agentSubmitExecute(params, ctx) {
       }
     }
     const newChildren = (params.new_children ?? []).map((nc) => buildIssueChild(nc, ctx.agent));
+    const { accepted: dedupedChildren } = dedupeNewChildren(item, newChildren);
+    let accepted = dedupedChildren;
+    let suppressed = [];
+    let effectiveParams = params;
+    const suppressedTrail = [];
     if (stepPhase === "review") {
       if (isReviewerFamily(ctx.agent)) {
         const dirtyNonDoc = await listDirtyNonDocFiles(wtPath);
@@ -45378,8 +45478,34 @@ ${fileLines}
 ` + `代码类改动不在此列：不要把探针改动或临时改动 commit 掉来绕过本检查；审查者不应修改代码逻辑，发现问题请报 issue。`);
         }
       }
+      if (isReviewerFamily(ctx.agent) && params.step_id !== "verify_cleanup") {
+        const store = await readExemptions(ctx.worktree);
+        const result = applyExemptionSuppression(accepted, store);
+        accepted = result.kept;
+        suppressed = result.suppressed;
+        for (const c of suppressed) {
+          const target = exemptionTargetOfChild(c);
+          const hit = store.items.find((record3) => matchesExemption(target, record3));
+          const f = resolveChildIssueFields(c);
+          suppressedTrail.push({
+            rule: hit?.rule,
+            file: f.file,
+            line: f.line,
+            key: hit?.key,
+            severity: c.severity ?? "",
+            description: c.description.slice(0, 200)
+          });
+        }
+        if (suppressed.length > 0 && params.verdict === "failed" && (params.failed_tasks?.length ?? 0) === 0 && params.boundary_expansion === undefined && !accepted.some((c) => isBlockingSeverity(c.severity))) {
+          for (const entry of suppressedTrail)
+            entry["verdict"] = "passed_auto";
+          effectiveParams = { ...params, verdict: "passed" };
+        }
+        if (suppressedTrail.length > 0)
+          item.metadata["exemption_suppressed"] = suppressedTrail;
+      }
       const stepCfg = workflow.stepMap.get(params.step_id).step;
-      handleReviewParams(item, params, newChildren, params.step_id, {
+      handleReviewParams(item, effectiveParams, accepted, params.step_id, {
         step: stepCfg,
         session: state.stacks ?? null,
         skipMustDoGate: isSupplementOnly(params) || isTaskVerifySupplementAllowed(item, params, params.step_id, ctx.agent)
@@ -45404,13 +45530,8 @@ ${fileLines}
         requiredItems: resolveStepMustDo(implStep, state.stacks ?? null)
       });
     }
-    const { accepted } = dedupeNewChildren(item, newChildren);
-    if (stepPhase === "review" && accepted.length > 0) {
-      const store = await readExemptions(ctx.worktree);
-      applyExemptionDowngrade(accepted, store);
-    }
-    if (stepPhase === "review" && params.verdict === "failed") {
-      assertFailedHasReason(item, params, accepted, params.step_id, ctx.agent);
+    if (stepPhase === "review" && effectiveParams.verdict === "failed") {
+      assertFailedHasReason(item, effectiveParams, accepted, params.step_id, ctx.agent);
     }
     if (stepPhase === "in_progress" && (params.fixed_issue_ids?.length || params.exempt_issue_ids?.length)) {
       resetReviewTagsOnFix(item, collectFixedExemptLayers(item, params.fixed_issue_ids ?? [], params.exempt_issue_ids ?? []));
@@ -45418,7 +45539,7 @@ ${fileLines}
     submitForStep(item, workflow, {
       stepId: params.step_id,
       agentKey: ctx.agent,
-      verdict: params.verdict,
+      verdict: effectiveParams.verdict,
       fixedIds: params.fixed_issue_ids,
       exemptIds: params.exempt_issue_ids,
       newChildren: accepted
@@ -45452,16 +45573,26 @@ ${fileLines}
       await writeDismissedExemption(ctx.worktree, child, { changeId: state.changeId, exemptedBy: ctx.agent });
     }
     await writeState(ctx.worktree, state);
-    if (autoCommitLines.length === 0)
+    const sections = [];
+    if (suppressedTrail.length > 0) {
+      const lines = suppressedTrail.map((entry) => {
+        const label = entry.rule !== undefined && entry.rule !== "" ? entry.rule : entry.key ?? "";
+        return `- ${label} | ${entry.file ?? ""}:${entry.line ?? ""} | 原级别 ${entry.severity}`;
+      });
+      sections.push([
+        "### 已抑制的存量豁免问题",
+        "",
+        ...lines,
+        "",
+        "命中项目级豁免清单的存量问题已抑制，不重复豁免；规则或行号真的变化时按原级别重新提报。"
+      ]);
+    }
+    if (autoCommitLines.length > 0) {
+      sections.push(["### worktree 自动提交", "", ...autoCommitLines]);
+    }
+    if (sections.length === 0)
       return SUBMIT_OK_MESSAGE;
-    return [
-      `## ✅ ${SUBMIT_OK_MESSAGE}`,
-      "",
-      "### worktree 自动提交",
-      "",
-      ...autoCommitLines,
-      ""
-    ].join(`
+    return [`## ✅ ${SUBMIT_OK_MESSAGE}`, "", ...sections.flatMap((s) => [...s, ""])].join(`
 `);
   } finally {
     releaseLock(lockPath);
@@ -46076,7 +46207,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "1.9.0";
+var PKG_VERSION = "1.10.0";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
