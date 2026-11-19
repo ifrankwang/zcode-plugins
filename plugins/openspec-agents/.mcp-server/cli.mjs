@@ -44149,6 +44149,15 @@ async function ensureChangeBranch(repoRoot, branch, baseBranch) {
     throw new Error(`创建分支 "${branch}"（fork 自 ${baseBranch}）失败：${created.stderr}`);
   return true;
 }
+async function worktreePathForBranch(repoRoot, branch) {
+  const wtList = await runGit(repoRoot, ["worktree", "list"]);
+  const line = wtList.split(`
+`).find((l) => {
+    const m = l.match(/^(\S+)\s+[0-9a-f]+\s+\[(.+?)\]/);
+    return m && m[2].trim() === branch;
+  });
+  return line ? line.match(/^(\S+)/)?.[1] : undefined;
+}
 async function listFilesRecursive(root, prefix = "") {
   let entries = [];
   try {
@@ -44372,13 +44381,7 @@ async function syncChangePlanDocs(repoRoot, worktreePath, state) {
 async function ensureChangeWorktree(repoRoot, state, item, branch, defaultPath, plan) {
   const applyPlan = async (worktreePath) => plan.sync ? await syncChangePlanDocs(repoRoot, worktreePath, state) : plan.skipNote;
   await ensureChangeBranch(repoRoot, branch, state.baseBranch);
-  const wtList = await runGit(repoRoot, ["worktree", "list"]);
-  const existingLine = wtList.split(`
-`).find((l) => {
-    const m = l.match(/^(\S+)\s+[0-9a-f]+\s+\[(.+?)\]/);
-    return m && m[2].trim() === branch;
-  });
-  const registeredPath = existingLine ? existingLine.match(/^(\S+)/)?.[1] : undefined;
+  const registeredPath = await worktreePathForBranch(repoRoot, branch);
   const targetPath = registeredPath ?? defaultPath;
   if (!await pathExists(targetPath)) {
     await runGitChecked(repoRoot, ["worktree", "prune"]);
@@ -44474,20 +44477,27 @@ async function setWorktreeExecute(params, ctx) {
   }
   const currentBranch = isReview ? "" : (await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
   const detached = !isReview && (currentBranch === "" || currentBranch === "HEAD");
-  const crossBranch = !isReview && !detached && currentBranch !== state.baseBranch;
+  const crossBranch = !isReview && !detached && currentBranch !== state.baseBranch && currentBranch !== branch;
   let planSync = false;
   let planSkipNote = "";
-  if (detached) {
-    const plan = await resolveDetachedPlan(repoRoot, state);
-    if (plan.blocked)
-      return withGitignoreGuard(guardNote, plan.blocked);
-    planSkipNote = plan.skipNote ?? "";
-  } else if (crossBranch) {
-    const plan = await resolveCrossBranchPlan(repoRoot, state, currentBranch);
-    if (plan.blocked)
-      return withGitignoreGuard(guardNote, plan.blocked);
-    planSync = plan.sync ?? false;
-    planSkipNote = plan.skipNote ?? "";
+  if (!isReview && (detached || crossBranch)) {
+    const reusePath = await worktreePathForBranch(repoRoot, branch);
+    const changeDirForReuse = `openspec/changes/${state.changeId}`;
+    const reusePlanOnBranch = reusePath !== undefined || await isLocalBranch(repoRoot, branch) && (await listTreePaths(repoRoot, branch, changeDirForReuse)).length > 0;
+    if (reusePlanOnBranch) {
+      planSkipNote = "";
+    } else if (detached) {
+      const plan = await resolveDetachedPlan(repoRoot, state);
+      if (plan.blocked)
+        return withGitignoreGuard(guardNote, plan.blocked);
+      planSkipNote = plan.skipNote ?? "";
+    } else {
+      const plan = await resolveCrossBranchPlan(repoRoot, state, currentBranch);
+      if (plan.blocked)
+        return withGitignoreGuard(guardNote, plan.blocked);
+      planSync = plan.sync ?? false;
+      planSkipNote = plan.skipNote ?? "";
+    }
   }
   if (!detached && !crossBranch) {
     const changeStatus = await runGit(repoRoot, ["status", "--porcelain", `openspec/changes/${state.changeId}/`]);
@@ -44504,13 +44514,7 @@ async function setWorktreeExecute(params, ctx) {
   let reused = false;
   let planNote = "";
   if (isReview) {
-    const wtList = await runGit(repoRoot, ["worktree", "list"]);
-    const existingLine = wtList.split(`
-`).find((l) => {
-      const m = l.match(/^(\S+)\s+[0-9a-f]+\s+\[(.+?)\]/);
-      return m && m[2].trim() === branch;
-    });
-    const existingPath = existingLine ? existingLine.match(/^(\S+)/)?.[1] : undefined;
+    const existingPath = await worktreePathForBranch(repoRoot, branch);
     if (existingPath) {
       const baseHead = await runGit(repoRoot, ["rev-parse", state.baseBranch]);
       const mergeResult = await runGitChecked(existingPath, ["merge", "--ff-only", baseHead]);
@@ -46141,7 +46145,7 @@ var OPX_TOOL_SPECS = [
   },
   {
     name: "opx_orch_set_worktree",
-    description: "按会话声明的形态补齐技术栈忽略基线（`.gitignore` / `.prettierignore`），编排产物强制覆盖；无法安全提交时只写工作树并说明。同时按本地容器探测结果补齐项目级扫描平台配置：缺失时按模板创建、已存在时只补缺失键，只写工作树不提交，探测不到则跳过。确保目标组的 git worktree 就绪。change 会话按 change 模型 create-or-reuse：分支 change/{changeId} 不存在时从基准分支 tip 创建，worktree 常驻于 .worktree/{changeId}/ws，全部任务组串行复用（复用校验：目录缺失自愈重建、openspec 文档脏自动提交、代码文件脏拒绝）。只补齐资源，不改变阶段。",
+    description: "按会话声明的形态补齐技术栈忽略基线（`.gitignore` / `.prettierignore`），编排产物强制覆盖；无法安全提交时只写工作树并说明。同时按本地容器探测结果补齐项目级扫描平台配置：缺失时按模板创建、已存在时只补缺失键，只写工作树不提交，探测不到则跳过。确保目标组的 git worktree 就绪。change 会话按 change 模型 create-or-reuse：分支 change/{changeId} 不存在时从基准分支 tip 创建，worktree 常驻于 .worktree/{changeId}/ws，全部任务组串行复用（复用校验：目录缺失自愈重建、openspec 文档脏自动提交、代码文件脏拒绝）。切组复用（worktree 可复用或主仓库已检出 change 分支）时跳过规划文档预检直接复用。只补齐资源，不改变阶段。",
     schema: setWorktreeSchema
   },
   {
@@ -46207,7 +46211,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "1.10.0";
+var PKG_VERSION = "1.10.1";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
