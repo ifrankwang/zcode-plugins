@@ -37289,7 +37289,7 @@ async function ensureIgnoreBaseline(repoRoot, opts = {}) {
       needsIntentToAdd.push(target);
       continue;
     }
-    if (statusLines.length === 1 && statusLines[0] === ` M ${target}`)
+    if (statusLines.length === 1 && (statusLines[0] === ` M ${target}` || statusLines[0] === `M ${target}`))
       continue;
     lines.push(renderCommitLine(commitTargets, [
       `\`${target}\` 在写入后出现预期外状态（${statusLines.join(" / ")}），提交会夹带非本次内容`
@@ -37602,7 +37602,7 @@ async function ensureProjectConfigs(repoRoot, assets, opts = {}) {
     list.push(asset);
     groups.set(asset.target, list);
   }
-  const slug = projectSlug(repoRoot);
+  const slug = opts.slug ?? projectSlug(repoRoot);
   const targets = [];
   for (const [target, group] of [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
     const sources = [...new Set(group.map((a) => a.skill))].map((s) => `skill \`${s}\``);
@@ -37686,23 +37686,36 @@ function renderProjectConfigReport(report) {
   });
 }
 async function ensureProjectConfigsForSession(repoRoot, session, probe, opts = {}) {
+  const outcome = await ensureProjectConfigsForSessionOutcome(repoRoot, session, probe, opts);
+  return "skip" in outcome ? renderProjectConfigSkip(outcome.skip) : renderProjectConfigReport(outcome.report).join(`
+`);
+}
+async function ensureProjectConfigsForSessionWithReport(repoRoot, session, probe, opts = {}) {
+  const outcome = await ensureProjectConfigsForSessionOutcome(repoRoot, session, probe, opts);
+  if ("skip" in outcome)
+    return { note: renderProjectConfigSkip(outcome.skip), writtenTargets: [] };
+  return {
+    note: renderProjectConfigReport(outcome.report).join(`
+`),
+    writtenTargets: outcome.report.targets.filter((t) => t.action !== "complete").map((t) => t.target)
+  };
+}
+async function ensureProjectConfigsForSessionOutcome(repoRoot, session, probe, opts = {}) {
   if (!session || session.project_stacks.length === 0) {
-    return renderProjectConfigSkip("no-session");
+    return { skip: "no-session" };
   }
   const assets = collectProjectConfigAssets(session, probe);
   const resolved = assets.length === 0 && probe.runtime !== null ? collectProjectConfigAssets(session, { ...probe, composeHits: collectComposeTexts(repoRoot) }) : assets;
   if (resolved.length === 0) {
     if (probe.runtime === null && probe.composeHits.length === 0) {
-      return renderProjectConfigSkip("no-runtime");
+      return { skip: "no-runtime" };
     }
     if (probe.runtime !== null && probe.containers.length === 0) {
-      return renderProjectConfigSkip("no-containers");
+      return { skip: "no-containers" };
     }
-    return renderProjectConfigSkip("no-match");
+    return { skip: "no-match" };
   }
-  const report = await ensureProjectConfigs(repoRoot, resolved, opts);
-  return renderProjectConfigReport(report).join(`
-`);
+  return { report: await ensureProjectConfigs(repoRoot, resolved, opts) };
 }
 
 // src/core/exemptions.ts
@@ -43861,6 +43874,53 @@ async function runBaselineGuards(ctx, ignoreOpts, session) {
   return ignoreNote.length > 0 ? `${ignoreNote}
 ${configNote}` : configNote;
 }
+async function runWorktreeBaselineGuards(worktreePath, repoRoot, state) {
+  const ignoreNote = await ensureIgnoreBaseline(worktreePath, {
+    skipCommit: false,
+    baseBranch: null,
+    session: state.stacks ?? null
+  });
+  const probe = await probeContainers(worktreePath);
+  let { note: configNote, writtenTargets } = await ensureProjectConfigsForSessionWithReport(worktreePath, state.stacks ?? null, probe, { slug: projectSlug(repoRoot) });
+  if (writtenTargets.length > 0) {
+    for (const target of writtenTargets) {
+      const status = await runGit(worktreePath, ["status", "--porcelain", "--", target]);
+      if (status.trim().length === 0)
+        continue;
+      const addN = await runGitChecked(worktreePath, ["add", "-N", "--", target]);
+      if (!addN.success)
+        throw new Error(`worktree 基线文件 git add -N 失败（${target}）：${addN.stderr}`);
+    }
+    const commit = await runGitChecked(worktreePath, [
+      "commit",
+      "-m",
+      "chore(baseline): sync project config baseline",
+      "--only",
+      "--",
+      ...writtenTargets
+    ]);
+    if (!commit.success)
+      throw new Error(`worktree 基线配置受控提交失败：${commit.stderr}`);
+    const headBefore = await runGit(worktreePath, ["rev-parse", "--verify", "HEAD"]);
+    const shown = await runGit(worktreePath, ["show", "--name-only", "--format=", "HEAD"]);
+    const committed = shown.split(`
+`).map((l) => l.trim()).filter(Boolean);
+    const missing = writtenTargets.filter((t) => !committed.includes(t));
+    if (missing.length > 0) {
+      throw new Error(`worktree 基线配置提交核验失败：以下目标未出现在 HEAD 提交中（HEAD=${headBefore.trim()}）：${missing.join("、")}`);
+    }
+    configNote += `
+- **版本库提交**: 已提交，仅含 ${writtenTargets.map((t) => `\`${t}\``).join("、")}（消息 \`chore(baseline): sync project config baseline\`）。`;
+  }
+  const notes = [ignoreNote, configNote].filter((n) => n.length > 0);
+  return notes.join(`
+`);
+}
+function joinGuardNote(guardNote, planNote) {
+  return guardNote.length > 0 ? `${guardNote}
+
+${planNote}` : planNote;
+}
 async function initExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_init");
   const args = { ...params };
@@ -44386,9 +44446,10 @@ async function ensureChangeWorktree(repoRoot, state, item, branch, defaultPath, 
   if (!await pathExists(targetPath)) {
     await runGitChecked(repoRoot, ["worktree", "prune"]);
     await runGit(repoRoot, ["worktree", "add", targetPath, branch]);
+    const guardNote2 = await runWorktreeBaselineGuards(targetPath, repoRoot, state);
     const planNote2 = await applyPlan(targetPath);
     await bindWorktreeRefs(item, targetPath, branch);
-    return { path: targetPath, reused: false, planNote: planNote2 };
+    return { path: targetPath, reused: false, planNote: joinGuardNote(guardNote2, planNote2) };
   }
   if (!registeredPath) {
     const addRes = await runGitChecked(repoRoot, ["worktree", "add", targetPath, branch]);
@@ -44396,9 +44457,10 @@ async function ensureChangeWorktree(repoRoot, state, item, branch, defaultPath, 
       throw new Error(`无法在 "${targetPath}" 就位 worktree：目录已存在且不是检出分支 "${branch}" 的 git worktree（git: ${addRes.stderr}）。
 ` + `请人工确认该目录内容并处理（删除或迁移）后重试。`);
     }
+    const guardNote2 = await runWorktreeBaselineGuards(targetPath, repoRoot, state);
     const planNote2 = await applyPlan(targetPath);
     await bindWorktreeRefs(item, targetPath, branch);
-    return { path: targetPath, reused: false, planNote: planNote2 };
+    return { path: targetPath, reused: false, planNote: joinGuardNote(guardNote2, planNote2) };
   }
   const statusOut = await runGit(targetPath, ["status", "--porcelain"]);
   const dirtyPaths = statusOut.split(`
@@ -44419,9 +44481,10 @@ async function ensureChangeWorktree(repoRoot, state, item, branch, defaultPath, 
     if (!commitResult.success)
       throw new Error(`worktree openspec 目录 git commit 失败：${commitResult.stderr}`);
   }
+  const guardNote = await runWorktreeBaselineGuards(targetPath, repoRoot, state);
   const planNote = await applyPlan(targetPath);
   await bindWorktreeRefs(item, targetPath, branch);
-  return { path: targetPath, reused: true, planNote };
+  return { path: targetPath, reused: true, planNote: joinGuardNote(guardNote, planNote) };
 }
 async function setWorktreeExecute(params, ctx) {
   assertOrchestrator(ctx, "opx_orch_set_worktree");
@@ -44572,6 +44635,8 @@ async function setWorktreeExecute(params, ctx) {
     `- **路径**: \`${item.metadata["worktree_path"]}\``,
     `- **分支**: \`${branch}\``,
     ...planNote ? ["", planNote] : [],
+    "",
+    "- **worktree 侧基线**: change 会话在 worktree 创建/复用时补跑基线守卫（.gitignore/.prettierignore 与扫描平台配置），并提交进 change 分支；独立审查会话维持只写主仓库、不在 worktree 侧提交。",
     ...stacksFallbackNote ? ["", stacksFallbackNote] : []
   ].join(`
 `));
@@ -46211,7 +46276,7 @@ async function ensureDefaultUnattended(args, ctx) {
     }
   } catch {}
 }
-var PKG_VERSION = "1.10.1";
+var PKG_VERSION = "1.10.2";
 function buildMcpServer(worktree, opts = {}) {
   const mcp = new McpServer({ name: "openspec-agents", version: PKG_VERSION });
   for (const [name, spec] of Object.entries(TOOL_SPECS)) {
